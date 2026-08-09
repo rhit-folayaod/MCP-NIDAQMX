@@ -10,10 +10,15 @@ Env:  DAQ_MCP_SIMULATE=1     force the simulated backend
       DAQ_MCP_ALLOW_WRITE=1  enable digital/analog output (off by default)
 """
 
+from __future__ import annotations
+
+import math
 import os
 from typing import Literal
 
 from fastmcp import FastMCP
+
+from daq_mcp.backend import get_backend
 
 mcp = FastMCP("daq-mcp")
 
@@ -33,6 +38,8 @@ WRITES_ENABLED = os.getenv("DAQ_MCP_ALLOW_WRITE") == "1"
 CHANNEL_ALLOWLIST = {"Dev1/ai0", "Dev1/ai1", "Dev1/port0/line0", "Dev1/port0/line1"}
 AO_VOLTAGE_LIMITS = (-5.0, 5.0)
 
+_PREVIEW_MAX_POINTS = 50
+
 
 class ChannelNotAllowed(Exception):
     pass
@@ -43,6 +50,42 @@ def _check(channel: str) -> None:
         raise ChannelNotAllowed(
             f"{channel!r} is not on the allowlist. Allowed: {sorted(CHANNEL_ALLOWLIST)}"
         )
+
+
+def _downsample(samples: list[float], max_points: int = _PREVIEW_MAX_POINTS) -> list[float]:
+    n = len(samples)
+    if n <= max_points:
+        return list(samples)
+    if max_points <= 1:
+        return [samples[0]] if n else []
+    step = (n - 1) / (max_points - 1)
+    return [samples[int(round(i * step))] for i in range(max_points)]
+
+
+def _waveform_stats(samples: list[float]) -> dict[str, float]:
+    n = len(samples)
+    if n == 0:
+        return {
+            "mean": 0.0,
+            "rms": 0.0,
+            "peak_to_peak": 0.0,
+            "std_dev": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    mean = sum(samples) / n
+    rms = math.sqrt(sum(x * x for x in samples) / n)
+    lo = min(samples)
+    hi = max(samples)
+    variance = sum((x - mean) ** 2 for x in samples) / n
+    return {
+        "mean": mean,
+        "rms": rms,
+        "peak_to_peak": hi - lo,
+        "std_dev": math.sqrt(variance),
+        "min": lo,
+        "max": hi,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -62,7 +105,7 @@ def list_devices() -> list[dict]:
     Returns the device name, product type, serial number, and which channel
     types it supports. Call this first — channel names are device-specific.
     """
-    ...
+    return get_backend().list_devices()
 
 
 @mcp.tool
@@ -73,7 +116,7 @@ def describe_device(device: str) -> dict:
     output channels, plus voltage ranges and max sample rates. Use this to
     pick valid channel names before reading or writing.
     """
-    ...
+    return get_backend().describe_device(device)
 
 
 @mcp.tool
@@ -93,7 +136,7 @@ def read_analog(
     signal without pulling thousands of raw floats into context.
     """
     _check(channel)
-    ...
+    return get_backend().read_analog(channel, samples, rate_hz, terminal_config)
 
 
 @mcp.tool
@@ -104,7 +147,7 @@ def read_digital(channel: str) -> dict:
     Returns {"channel": ..., "value": true/false}.
     """
     _check(channel)
-    ...
+    return get_backend().read_digital(channel)
 
 
 @mcp.tool
@@ -117,7 +160,7 @@ def write_digital(channel: str, value: bool) -> dict:
     if not WRITES_ENABLED:
         return {"error": "Writes disabled. Set DAQ_MCP_ALLOW_WRITE=1 to enable."}
     _check(channel)
-    ...
+    return get_backend().write_digital(channel, value)
 
 
 @mcp.tool
@@ -133,7 +176,15 @@ def write_analog(channel: str, voltage: float) -> dict:
     _check(channel)
     lo, hi = AO_VOLTAGE_LIMITS
     applied = max(lo, min(hi, voltage))
-    ...
+    result = get_backend().write_analog(channel, applied)
+    if "error" in result:
+        return result
+    return {
+        "channel": channel,
+        "requested_voltage": voltage,
+        "applied_voltage": applied,
+        "clamped": applied != voltage,
+    }
 
 
 @mcp.tool
@@ -145,7 +196,19 @@ def monitor_analog(channel: str, duration_s: float, rate_hz: float = 1000.0) -> 
     full sample array. Keeps large acquisitions out of the context window.
     """
     _check(channel)
-    ...
+    result = get_backend().acquire_waveform(channel, duration_s, rate_hz)
+    if "error" in result:
+        return result
+    samples = result.get("samples", [])
+    stats = _waveform_stats(samples)
+    return {
+        "channel": channel,
+        "duration_s": duration_s,
+        "rate_hz": rate_hz,
+        "sample_count": result.get("sample_count", len(samples)),
+        **stats,
+        "preview": _downsample(samples),
+    }
 
 
 @mcp.tool
@@ -154,7 +217,7 @@ def self_test(device: str) -> dict:
 
     Useful as a first diagnostic when reads return unexpected values.
     """
-    ...
+    return get_backend().self_test(device)
 
 
 # --------------------------------------------------------------------------
@@ -165,7 +228,16 @@ def self_test(device: str) -> dict:
 @mcp.resource("daq://config")
 def current_config() -> str:
     """The active safety configuration: allowlist, write status, voltage limits."""
-    ...
+    lo, hi = AO_VOLTAGE_LIMITS
+    lines = [
+        "daq-mcp safety configuration",
+        f"writes_enabled: {WRITES_ENABLED}",
+        f"ao_voltage_limits: [{lo}, {hi}]",
+        "channel_allowlist:",
+    ]
+    for ch in sorted(CHANNEL_ALLOWLIST):
+        lines.append(f"  - {ch}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

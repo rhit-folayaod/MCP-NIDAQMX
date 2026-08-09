@@ -1,0 +1,43 @@
+---
+description: Backend abstraction and nidaqmx API rules for daq-mcp
+globs:
+  - server.py
+  - src/daq_mcp/**/*.py
+  - tests/**/*.py
+alwaysApply: false
+---
+
+# daq-mcp engineering rules
+
+## Backend boundary
+
+MCP tools in `server.py` must never import or call `nidaqmx` directly. All
+hardware access goes through `daq_mcp.backend.get_backend()` and the
+`DAQBackend` interface. That boundary keeps the server testable without NI
+drivers and lets simulation and real hardware share one tool surface.
+
+If you need a new hardware capability, add it to `DAQBackend` first, implement
+it in both backends (or explicitly document why simulation cannot support it),
+then call it from the tool.
+
+## Allowlist every channel argument
+
+Any new tool that accepts a channel name must call `_check(channel)` (or an
+equivalent allowlist gate) before touching the backend. Writes must also
+respect `WRITES_ENABLED` / `DAQ_MCP_ALLOW_WRITE`. Do not add a bypass "just
+for debugging" in committed code.
+
+Analog output must clamp to `AO_VOLTAGE_LIMITS` and return both requested and
+applied values plus a `clamped` flag. Digital writes must return hardware
+read-back, not an echo of the requested value.
+
+## Do not guess the nidaqmx API
+
+Before writing or changing real-backend calls, verify them against the current
+nidaqmx documentation (task creation, channel naming, terminal configuration,
+timing, error types). Do not invent method names or parameter shapes from
+memory — plausible-looking wrong calls fail only on hardware.
+
+If a call is uncertain, say so and look it up. Prefer one Task per operation,
+created and closed inside the call. Catch `nidaqmx.errors.DaqError` and return
+a structured `{error, error_code}` dict instead of leaking a traceback.

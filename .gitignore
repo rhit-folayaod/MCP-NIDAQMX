@@ -9,3 +9,9 @@ dist/
 build/
 .DS_Store
 .env
+.env.*
+!.env.example
+
+# Machine-local MCP launch config (paths, write-enable flags). Keep examples.
+.cursor/mcp.json
+**/mcp.local.json

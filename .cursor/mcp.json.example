@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "daq-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/MCP-NIDAQMX",
+        "server.py"
+      ],
+      "env": {
+        "DAQ_MCP_SIMULATE": "1"
+      }
+    }
+  }
+}

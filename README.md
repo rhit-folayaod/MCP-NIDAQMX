@@ -9,10 +9,6 @@ hallucinated channel name or a stray analog output can damage equipment or
 hurt someone. The protocol plumbing is the easy part; the safety model is
 the point of the project.
 
-```
-[ demo GIF placeholder ]
-```
-
 ## Safety model
 
 Writes are off by default. Only channels on an explicit allowlist can be

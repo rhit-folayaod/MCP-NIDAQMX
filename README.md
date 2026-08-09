@@ -75,13 +75,18 @@ cd MCP-NIDAQMX
 DAQ_MCP_SIMULATE=1 npx -y @modelcontextprotocol/inspector uv run server.py
 ```
 
-On Windows PowerShell:
+On Windows PowerShell, pass the variable with Inspector's `-e` flag rather than
+setting it in the shell — Inspector spawns the server with a sanitized
+environment and does not forward arbitrary shell variables:
 
 ```powershell
-cd C:\Users\folayaod\personal\MCP-NIDAQMX
-$env:DAQ_MCP_SIMULATE = "1"
-npx -y @modelcontextprotocol/inspector uv run server.py
+cd path\to\MCP-NIDAQMX
+npx -y @modelcontextprotocol/inspector -e DAQ_MCP_SIMULATE=1 uv run server.py
 ```
+
+If tools return "No results yet" for `list_devices`, the server is talking to
+real hardware and correctly reporting zero devices — the simulate flag did not
+reach it. The startup log line on stderr reports which backend was selected.
 
 ## Cursor configuration
 
@@ -92,11 +97,11 @@ to `uv` so Cursor does not depend on PATH:
 {
   "mcpServers": {
     "daq-mcp": {
-      "command": "C:\\Users\\folayaod\\.local\\bin\\uv.exe",
+      "command": "C:\\Users\\<you>\\.local\\bin\\uv.exe",
       "args": [
         "run",
         "--directory",
-        "C:\\Users\\folayaod\\personal\\MCP-NIDAQMX",
+        "C:\\path\\to\\MCP-NIDAQMX",
         "server.py"
       ],
       "env": {

@@ -12,8 +12,10 @@ Env:  DAQ_MCP_SIMULATE=1     force the simulated backend
 
 from __future__ import annotations
 
+import logging
 import math
 import os
+import sys
 from typing import Literal
 
 from fastmcp import FastMCP
@@ -241,4 +243,13 @@ def current_config() -> str:
 
 
 if __name__ == "__main__":
+    # stderr only — stdout carries the JSON-RPC stream.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
+    # NI-DAQmx must be probed on the main thread. FastMCP runs sync tools in a
+    # worker thread; lazy backend init there can deadlock on Windows over stdio.
+    backend = get_backend()
+    logging.getLogger("daq-mcp").info(
+        "backend=%s writes_enabled=%s", type(backend).__name__, WRITES_ENABLED
+    )
     mcp.run()

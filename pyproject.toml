@@ -1,0 +1,26 @@
+[project]
+name = "daq-mcp"
+version = "0.1.0"
+description = "MCP server that exposes NI DAQ hardware to AI coding clients"
+readme = "README.md"
+authors = [
+    { name = "rhit-folayaod", email = "folayaod@rose-hulman.edu" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+]
+
+[project.optional-dependencies]
+hardware = [
+    "nidaqmx",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"

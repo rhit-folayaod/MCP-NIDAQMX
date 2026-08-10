@@ -211,13 +211,10 @@ class NIDAQmxBackend(DAQBackend):
                     line_grouping=LineGrouping.CHAN_PER_LINE,
                 )
                 task.write(bool(value))
-
-            # Read back from hardware rather than echoing the request.
-            with nidaqmx.Task() as task:
-                task.di_channels.add_di_chan(
-                    channel,
-                    line_grouping=LineGrouping.CHAN_PER_LINE,
-                )
+                # Read back from the DO task itself. A separate DI task on the
+                # same line reconfigures it as an input, which drops the drive
+                # and reports whatever the external circuit pulls the line to
+                # rather than what we just wrote.
                 raw = task.read()
             actual = bool(raw) if isinstance(raw, (bool, int)) else bool(raw[0])
             return {"channel": channel, "value": actual}

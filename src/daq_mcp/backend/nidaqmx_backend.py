@@ -16,11 +16,17 @@ API calls follow the published nidaqmx docs:
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, TypeVar
 
 from daq_mcp.backend.base import DAQBackend, TerminalConfig
 
 T = TypeVar("T")
+
+# -200284: requested samples not yet acquired. Expected when polling a
+# continuous task faster than the hardware fills it; every other code means
+# the task is broken.
+_BENIGN_STREAM_ERRORS = frozenset({-200284})
 
 
 def _daq_error(exc: Exception) -> dict[str, Any]:
@@ -67,6 +73,12 @@ class NIDAQmxBackend(DAQBackend):
         self._System = System
         # Probe the driver so missing DLLs fail at selection, not mid-tool-call.
         _ = list(System.local().devices)
+
+        # The one long-lived task in this class. Guarded by a lock because the
+        # monitor thread drains it while MCP tool calls may stop it.
+        self._stream_task: Any = None
+        self._stream_channel: str | None = None
+        self._stream_lock = threading.Lock()
 
     def _terminal(self, terminal_config: TerminalConfig):
         from nidaqmx.constants import TerminalConfiguration
@@ -278,6 +290,93 @@ class NIDAQmxBackend(DAQBackend):
             }
         except DaqError as exc:
             return _daq_error(exc)
+
+    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+        import nidaqmx
+        from nidaqmx.constants import AcquisitionType
+        from nidaqmx.errors import DaqError
+
+        if rate_hz <= 0:
+            return {"error": "rate_hz must be > 0"}
+
+        with self._stream_lock:
+            if self._stream_task is not None:
+                return {
+                    "error": f"Already streaming {self._stream_channel!r}; stop it first"
+                }
+            try:
+                task = nidaqmx.Task()
+                task.ai_channels.add_ai_voltage_chan(
+                    channel,
+                    terminal_config=self._terminal("default"),
+                    min_val=-10.0,
+                    max_val=10.0,
+                )
+                # Ten seconds of slack. An overflow (-200279) is fatal to the
+                # task, so the buffer needs to absorb a consumer that stalls on
+                # a GC pause or a burst of dashboard traffic, not just jitter.
+                task.timing.cfg_samp_clk_timing(
+                    rate=rate_hz,
+                    sample_mode=AcquisitionType.CONTINUOUS,
+                    samps_per_chan=max(10_000, int(rate_hz * 10)),
+                )
+                task.start()
+            except DaqError as exc:
+                try:
+                    task.close()
+                except Exception:
+                    pass
+                return _daq_error(exc)
+
+            self._stream_task = task
+            self._stream_channel = channel
+            return {"channel": channel, "rate_hz": rate_hz}
+
+    def read_stream(self, max_samples: int = 10_000) -> list[float]:
+        from nidaqmx.errors import DaqError
+
+        with self._stream_lock:
+            task = self._stream_task
+            if task is None:
+                return []
+            try:
+                available = task.in_stream.avail_samp_per_chan
+                if available <= 0:
+                    return []
+                raw = task.read(
+                    number_of_samples_per_channel=min(available, max_samples),
+                    timeout=1.0,
+                )
+            except DaqError as exc:
+                # Only "nothing ready yet" is worth ignoring. Anything else --
+                # buffer overflow, device unplugged, invalidated task -- leaves
+                # the task permanently dead, and swallowing it would make a
+                # stalled stream look exactly like an idle one.
+                if exc.error_code in _BENIGN_STREAM_ERRORS:
+                    return []
+                raise
+        return _as_float_list(raw)
+
+    def stop_stream(self) -> dict[str, Any]:
+        with self._stream_lock:
+            task = self._stream_task
+            channel = self._stream_channel
+            self._stream_task = None
+            self._stream_channel = None
+        if task is None:
+            return {"stopped": None}
+        try:
+            task.stop()
+        except Exception:
+            pass
+        try:
+            task.close()
+        except Exception:
+            pass
+        return {"stopped": channel}
+
+    def streaming_channel(self) -> str | None:
+        return self._stream_channel
 
     def self_test(self, device: str) -> dict[str, Any]:
         from nidaqmx.errors import DaqError

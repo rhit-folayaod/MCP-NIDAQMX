@@ -9,7 +9,11 @@
         "server.py"
       ],
       "env": {
-        "DAQ_MCP_SIMULATE": "1"
+        "DAQ_MCP_SIMULATE": "1",
+
+        "_comment_write": "Remove DAQ_MCP_SIMULATE and set this only when you intend to drive real outputs.",
+        "_comment_dashboard": "Set DAQ_MCP_DASHBOARD to 1 to serve the live dashboard at http://127.0.0.1:8765/. Only one server process can hold the device at a time.",
+        "_comment_live": "DAQ_MCP_LIVE_CHANNEL and DAQ_MCP_LIVE_RATE choose what streams on startup."
       }
     }
   }

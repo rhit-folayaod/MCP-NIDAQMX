@@ -69,6 +69,9 @@ class SimulatedBackend(DAQBackend):
         # Digital line state persists across calls (write then read reflects write).
         self._digital: dict[str, bool] = {}
         self._analog_out: dict[str, float] = {}
+        self._stream_channel: str | None = None
+        self._stream_rate_hz: float = 0.0
+        self._stream_last_read: float = 0.0
 
     def list_devices(self) -> list[dict[str, Any]]:
         result = []
@@ -171,6 +174,41 @@ class SimulatedBackend(DAQBackend):
                 "error": f"Unknown device {device!r}",
             }
         return {"device": device, "passed": True}
+
+    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+        if self._stream_channel is not None:
+            return {
+                "error": f"Already streaming {self._stream_channel!r}; stop it first"
+            }
+        if rate_hz <= 0:
+            return {"error": "rate_hz must be > 0"}
+        self._stream_channel = channel
+        self._stream_rate_hz = rate_hz
+        self._stream_last_read = time.monotonic()
+        return {"channel": channel, "rate_hz": rate_hz}
+
+    def read_stream(self, max_samples: int = 10_000) -> list[float]:
+        if self._stream_channel is None:
+            return []
+        # Produce however many samples the elapsed wall time should have
+        # generated, so the simulated stream tracks real time like hardware.
+        now = time.monotonic()
+        elapsed = now - self._stream_last_read
+        n = int(elapsed * self._stream_rate_hz)
+        if n <= 0:
+            return []
+        n = min(n, max_samples)
+        self._stream_last_read += n / self._stream_rate_hz
+        return self._generate_ai(self._stream_channel, n, self._stream_rate_hz)
+
+    def stop_stream(self) -> dict[str, Any]:
+        channel = self._stream_channel
+        self._stream_channel = None
+        self._stream_rate_hz = 0.0
+        return {"stopped": channel}
+
+    def streaming_channel(self) -> str | None:
+        return self._stream_channel
 
     def _generate_ai(self, channel: str, n: int, rate_hz: float) -> list[float]:
         """ai0-style: slow sine. ai1-style: noisy DC. Others: noisy DC at 0 V."""

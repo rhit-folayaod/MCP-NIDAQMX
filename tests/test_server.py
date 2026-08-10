@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -21,14 +22,28 @@ def _fresh_backend(monkeypatch):
     monkeypatch.setenv("DAQ_MCP_SIMULATE", "1")
     monkeypatch.delenv("DAQ_MCP_ALLOW_WRITE", raising=False)
     monkeypatch.setattr(server, "WRITES_ENABLED", False)
+    # line0/line1 stand in for inputs (buttons), ao0/line6 for outputs.
+    monkeypatch.setattr(server, "DIGITAL_INPUTS", {"Dev1/port0/line0", "Dev1/port0/line1"})
+    monkeypatch.setattr(server, "DIGITAL_OUTPUTS", {"Dev1/port0/line6"})
+    monkeypatch.setattr(server, "ANALOG_OUTPUTS", {"Dev1/ao0"})
     monkeypatch.setattr(
         server,
         "CHANNEL_ALLOWLIST",
-        {"Dev1/ai0", "Dev1/ai1", "Dev1/ao0", "Dev1/port0/line0", "Dev1/port0/line1"},
+        {
+            "Dev1/ai0",
+            "Dev1/ai1",
+            "Dev1/ao0",
+            "Dev1/port0/line0",
+            "Dev1/port0/line1",
+            "Dev1/port0/line6",
+        },
     )
+    monkeypatch.setattr(server, "WRITABLE_CHANNELS", {"Dev1/ao0", "Dev1/port0/line6"})
     monkeypatch.setattr(server, "AO_VOLTAGE_LIMITS", (-5.0, 5.0))
     reset_backend()
     yield
+    if server.live.is_streaming():
+        server.live.stop()
     reset_backend()
 
 
@@ -137,14 +152,48 @@ def test_monitor_analog_short_preview_not_padded():
 def test_digital_write_read_round_trip(monkeypatch):
     monkeypatch.setattr(server, "WRITES_ENABLED", True)
 
-    written = server.write_digital("Dev1/port0/line0", True)
+    written = server.write_digital("Dev1/port0/line6", True)
     assert written["value"] is True
 
-    read_back = server.read_digital("Dev1/port0/line0")
+    read_back = server.read_digital("Dev1/port0/line6")
     assert read_back["value"] is True
 
-    server.write_digital("Dev1/port0/line0", False)
-    assert server.read_digital("Dev1/port0/line0")["value"] is False
+    server.write_digital("Dev1/port0/line6", False)
+    assert server.read_digital("Dev1/port0/line6")["value"] is False
+
+
+def test_input_channels_cannot_be_written(monkeypatch):
+    """Buttons are readable but must never be driven: that is a short circuit."""
+    monkeypatch.setattr(server, "WRITES_ENABLED", True)
+
+    with pytest.raises(server.ChannelNotWritable):
+        server.write_digital("Dev1/port0/line0", True)
+
+    with pytest.raises(server.ChannelNotWritable):
+        server.write_analog("Dev1/ai0", 1.0)
+
+    # Reading the same line is still fine.
+    assert server.read_digital("Dev1/port0/line0")["value"] in (True, False)
+
+
+def test_dashboard_write_uses_the_same_gate(monkeypatch):
+    """The browser must not get a laxer path to the pins than the model."""
+    refused = server._dashboard_set_digital("Dev1/port0/line6", True)
+    assert "error" in refused
+    assert "DAQ_MCP_ALLOW_WRITE" in refused["error"]
+
+    monkeypatch.setattr(server, "WRITES_ENABLED", True)
+
+    blocked = server._dashboard_set_digital("Dev1/port0/line0", True)
+    assert "error" in blocked
+    assert "cannot be written" in blocked["error"]
+
+    unlisted = server._dashboard_set_digital("Dev1/port0/line9", True)
+    assert "error" in unlisted
+    assert "allowlist" in unlisted["error"]
+
+    ok = server._dashboard_set_digital("Dev1/port0/line6", True)
+    assert ok["value"] is True
 
 
 def test_ai0_and_ai1_signals_differ():
@@ -157,3 +206,73 @@ def test_ai0_and_ai1_signals_differ():
 
 def test_uses_simulated_backend():
     assert type(get_backend()).__name__ == "SimulatedBackend"
+
+
+# --------------------------------------------------------------------------
+# Live acquisition
+# --------------------------------------------------------------------------
+
+
+def _wait_for_samples(min_count: int = 20, timeout_s: float = 3.0) -> dict:
+    """Poll until the rolling window fills; streaming is inherently async."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        snap = server.live_status()
+        if snap["window_samples"] >= min_count:
+            return snap
+        time.sleep(0.05)
+    return server.live_status()
+
+
+def test_start_live_streams_and_stops():
+    started = server.start_live("Dev1/ai0", rate_hz=1000.0)
+    assert started["streaming"] is True
+    assert server.live.is_streaming("Dev1/ai0")
+
+    snap = _wait_for_samples()
+    assert snap["window_samples"] > 0
+    assert snap["latest"] is not None
+    assert len(snap["trace"]) <= 50
+
+    server.stop_live()
+    assert not server.live.is_streaming()
+
+
+def test_only_one_stream_at_a_time():
+    server.start_live("Dev1/ai0", rate_hz=1000.0)
+    second = server.start_live("Dev1/ai1", rate_hz=1000.0)
+    assert "error" in second
+    server.stop_live()
+
+
+def test_start_live_respects_allowlist():
+    with pytest.raises(server.ChannelNotAllowed):
+        server.start_live("Dev1/ai42", rate_hz=1000.0)
+
+
+def test_reads_come_from_buffer_while_streaming():
+    """A streaming channel is reserved, so reads must not open a second task."""
+    server.start_live("Dev1/ai0", rate_hz=1000.0)
+    _wait_for_samples(min_count=50)
+
+    result = server.read_analog("Dev1/ai0", samples=10)
+    assert result["source"] == "live_buffer"
+    assert len(result["samples"]) <= 10
+
+    windowed = server.monitor_analog("Dev1/ai0", duration_s=0.05, rate_hz=1000.0)
+    assert windowed["sample_count"] > 0
+    assert len(windowed["preview"]) <= 50
+
+    server.stop_live()
+
+    # Once stopped, one-shot acquisition takes over again.
+    after = server.read_analog("Dev1/ai0", samples=5)
+    assert "source" not in after
+    assert len(after["samples"]) == 5
+
+
+def test_dashboard_config_reports_directions():
+    cfg = server._dashboard_config()
+    assert cfg["digital_outputs"] == ["Dev1/port0/line6"]
+    assert "Dev1/port0/line0" in cfg["digital_inputs"]
+    assert cfg["writes_enabled"] is False

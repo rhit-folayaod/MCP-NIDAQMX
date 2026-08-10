@@ -57,3 +57,37 @@ class DAQBackend(ABC):
     @abstractmethod
     def self_test(self, device: str) -> dict[str, Any]:
         """Run the device self-test; return pass/fail."""
+
+    # ----------------------------------------------------------------------
+    # Continuous acquisition.
+    #
+    # Unlike every other method here, these three are stateful: the task stays
+    # open between calls. A driver reserves a channel for the lifetime of a
+    # task, so while a stream is running nothing else in this process (or any
+    # other) can open that channel for a one-shot read. Callers are expected
+    # to serve snapshot reads of a streaming channel from the buffer instead.
+    # ----------------------------------------------------------------------
+
+    @abstractmethod
+    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+        """Begin continuous acquisition on one channel.
+
+        Returns {"channel", "rate_hz"} on success or {"error"} on failure.
+        Starting a stream while one is already running is an error.
+        """
+
+    @abstractmethod
+    def read_stream(self, max_samples: int = 10_000) -> list[float]:
+        """Drain whatever samples have accumulated since the last call.
+
+        Returns an empty list when no samples are ready. Never blocks waiting
+        for the buffer to fill.
+        """
+
+    @abstractmethod
+    def stop_stream(self) -> dict[str, Any]:
+        """Stop continuous acquisition and release the channel."""
+
+    @abstractmethod
+    def streaming_channel(self) -> str | None:
+        """The channel currently being streamed, or None."""

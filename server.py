@@ -13,6 +13,7 @@ Env:  DAQ_MCP_SIMULATE=1     force the simulated backend
 from __future__ import annotations
 
 import logging
+import json
 import math
 import os
 import sys
@@ -23,7 +24,18 @@ from fastmcp import FastMCP
 
 from daq_mcp.backend import get_backend
 from daq_mcp.live import LiveMonitor
-from daq_mcp.wiring import Wiring, load_wiring, save_wiring, validate_wiring, wiring_path
+from daq_mcp.wiring import (
+    Wiring,
+    delete_profile,
+    get_active_profile_name,
+    list_profiles,
+    load_profile,
+    load_wiring,
+    save_profile,
+    set_active_profile_name,
+    validate_wiring,
+    wiring_path,
+)
 
 mcp = FastMCP("daq-mcp")
 
@@ -44,7 +56,7 @@ mcp = FastMCP("daq-mcp")
 # channels by direction means "this is an input" is enforced, not remembered.
 #
 # The defaults below match one USB-6421 bench. Override them from the dashboard
-# channel picker; choices land in .daq_mcp_wiring.json (gitignored).
+# channel picker; named profiles land in .daq_mcp_profiles/ (gitignored).
 # --------------------------------------------------------------------------
 
 WRITES_ENABLED = os.getenv("DAQ_MCP_ALLOW_WRITE") == "1"
@@ -82,8 +94,18 @@ _current_wiring = _DEFAULT_WIRING
 _dashboard_serving = False
 
 
-def _apply_wiring(wiring: Wiring, *, restart_live: bool = False) -> dict[str, Any]:
-    """Install wiring into the module-level allowlists the tools consult."""
+def _apply_wiring(
+    wiring: Wiring,
+    *,
+    restart_live: bool = False,
+    respect_env: bool = False,
+) -> dict[str, Any]:
+    """Install wiring into the module-level allowlists the tools consult.
+
+    Profile save/load always takes the profile's live channel/rate. Env overrides
+    (`DAQ_MCP_LIVE_CHANNEL` / `DAQ_MCP_LIVE_RATE`) apply only when
+    `respect_env=True` (startup with no explicit profile action).
+    """
     global ANALOG_INPUTS, ANALOG_OUTPUTS, DIGITAL_INPUTS, DIGITAL_OUTPUTS
     global CHANNEL_ALLOWLIST, WRITABLE_CHANNELS, LIVE_CHANNEL, LIVE_RATE_HZ
     global _current_wiring
@@ -97,9 +119,14 @@ def _apply_wiring(wiring: Wiring, *, restart_live: bool = False) -> dict[str, An
             ANALOG_INPUTS | ANALOG_OUTPUTS | DIGITAL_INPUTS | DIGITAL_OUTPUTS
         )
         WRITABLE_CHANNELS = ANALOG_OUTPUTS | DIGITAL_OUTPUTS
-        # Env override still wins for the live channel/rate if set.
-        LIVE_CHANNEL = os.getenv("DAQ_MCP_LIVE_CHANNEL") or wiring.live_channel
-        LIVE_RATE_HZ = float(os.getenv("DAQ_MCP_LIVE_RATE") or wiring.live_rate_hz)
+        if respect_env:
+            LIVE_CHANNEL = os.getenv("DAQ_MCP_LIVE_CHANNEL") or wiring.live_channel
+            LIVE_RATE_HZ = float(
+                os.getenv("DAQ_MCP_LIVE_RATE") or wiring.live_rate_hz
+            )
+        else:
+            LIVE_CHANNEL = wiring.live_channel
+            LIVE_RATE_HZ = wiring.live_rate_hz
         _current_wiring = wiring
 
     result: dict[str, Any] = {"ok": True, "wiring": wiring.to_dict()}
@@ -122,8 +149,16 @@ def _load_wiring_at_startup() -> None:
     except ValueError as exc:
         logging.getLogger("daq-mcp").warning("ignoring wiring file: %s", exc)
         return
-    _apply_wiring(wiring, restart_live=False)
-    if wiring_path().is_file():
+    # If a named profile is active, it wins; otherwise allow env overrides.
+    _apply_wiring(
+        wiring,
+        restart_live=False,
+        respect_env=get_active_profile_name() is None,
+    )
+    active = get_active_profile_name()
+    if active:
+        logging.getLogger("daq-mcp").info("loaded wiring profile %r", active)
+    elif wiring_path().is_file():
         logging.getLogger("daq-mcp").info("loaded wiring from %s", wiring_path())
 
 
@@ -405,17 +440,14 @@ def live_status() -> dict:
 
 @mcp.tool
 def get_wiring() -> dict:
-    """Return the active channel roles (inputs vs outputs) and live stream target.
-
-    Same data the dashboard channel picker shows. Does not invent what is
-    physically wired — only what this server is currently allowed to touch.
-    """
+    """Return the active channel roles, profile name, and saved profile list."""
     with _wiring_lock:
         wiring = _current_wiring.to_dict()
     return {
         "wiring": wiring,
+        "active_profile": get_active_profile_name(),
+        "profiles": list_profiles(),
         "path": str(wiring_path()),
-        "file_exists": wiring_path().is_file(),
         "allowlist": sorted(CHANNEL_ALLOWLIST),
         "writable": sorted(WRITABLE_CHANNELS),
     }
@@ -430,12 +462,12 @@ def set_wiring(
     digital_outputs: list[str],
     analog_outputs: list[str] | None = None,
     live_rate_hz: float = 1000.0,
+    profile_name: str | None = None,
 ) -> dict:
-    """Update channel roles and persist them to the local wiring file.
+    """Update channel roles and save them as a named local profile.
 
-    Use this when the bench changes and the dashboard is not open. A digital
-    line cannot be both input and output. Live acquisition restarts on success
-    so the agent and dashboard stay on the same allowlist.
+    If profile_name is omitted, overwrites the active profile (or creates
+    'default'). Live acquisition restarts on success.
     """
     body = {
         "device": device,
@@ -445,8 +477,30 @@ def set_wiring(
         "analog_outputs": list(analog_outputs or []),
         "digital_inputs": digital_inputs,
         "digital_outputs": digital_outputs,
+        "profile_name": profile_name,
     }
     return _dashboard_set_wiring(body)
+
+
+@mcp.tool
+def list_wiring_profiles() -> dict:
+    """List named wiring profiles saved on this machine."""
+    return {
+        "active_profile": get_active_profile_name(),
+        "profiles": list_profiles(),
+    }
+
+
+@mcp.tool
+def load_wiring_profile(name: str) -> dict:
+    """Activate a saved wiring profile and restart live acquisition."""
+    return _dashboard_load_profile(name)
+
+
+@mcp.tool
+def delete_wiring_profile(name: str) -> dict:
+    """Delete a named wiring profile from local disk."""
+    return _dashboard_delete_profile(name)
 
 
 def _dashboard_url() -> str | None:
@@ -522,6 +576,8 @@ def _dashboard_config() -> dict:
         "live_rate_hz": LIVE_RATE_HZ,
         "wiring": wiring,
         "wiring_file": str(wiring_path()),
+        "active_profile": get_active_profile_name(),
+        "profiles": list_profiles(),
     }
 
 
@@ -530,6 +586,7 @@ def _dashboard_inventory(device: str | None = None) -> dict:
 
 
 def _dashboard_set_wiring(body: dict[str, Any]) -> dict:
+    name = body.get("profile_name") or body.get("name")
     try:
         wiring = Wiring.from_dict(body)
     except ValueError as exc:
@@ -541,14 +598,50 @@ def _dashboard_set_wiring(body: dict[str, Any]) -> dict:
     if problems:
         return {"error": "; ".join(problems), "problems": problems}
 
+    profile_name = name if isinstance(name, str) and name.strip() else (
+        get_active_profile_name() or "default"
+    )
     try:
-        path = save_wiring(wiring)
-    except OSError as exc:
-        return {"error": f"Could not save wiring: {exc}"}
+        path = save_profile(str(profile_name), wiring, make_active=True)
+    except (OSError, ValueError) as exc:
+        return {"error": f"Could not save profile: {exc}"}
 
     applied = _apply_wiring(wiring, restart_live=True)
     applied["path"] = str(path)
+    applied["active_profile"] = get_active_profile_name()
+    applied["profiles"] = list_profiles()
     return applied
+
+
+def _dashboard_load_profile(name: str) -> dict:
+    try:
+        wiring = load_profile(name)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return {"error": str(exc)}
+    set_active_profile_name(name)
+    applied = _apply_wiring(wiring, restart_live=True)
+    applied["active_profile"] = get_active_profile_name()
+    applied["profiles"] = list_profiles()
+    return applied
+
+
+def _dashboard_delete_profile(name: str) -> dict:
+    try:
+        result = delete_profile(name)
+    except (ValueError, OSError) as exc:
+        return {"error": str(exc)}
+    # If we deleted the active profile, keep running on in-memory wiring until
+    # the user loads or saves another — do not silently revert to defaults.
+    result["active_profile"] = get_active_profile_name()
+    result["profiles"] = list_profiles()
+    return result
+
+
+def _dashboard_list_profiles() -> dict:
+    return {
+        "active_profile": get_active_profile_name(),
+        "profiles": list_profiles(),
+    }
 
 
 def _build_dashboard_app(mcp_app=None):
@@ -560,6 +653,9 @@ def _build_dashboard_app(mcp_app=None):
         config=_dashboard_config,
         inventory=_dashboard_inventory,
         set_wiring=_dashboard_set_wiring,
+        list_profiles=_dashboard_list_profiles,
+        load_profile=_dashboard_load_profile,
+        delete_profile=_dashboard_delete_profile,
         mcp_app=mcp_app,
         auth_token=AUTH_TOKEN,
     )

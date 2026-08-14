@@ -157,14 +157,17 @@ the stream itself with `start_live`, `live_status`, and `stop_live`.
 The **Channel wiring** panel on the dashboard lists every AI / AO / DIO pin the
 driver reports for the selected device. Check the ones you want on the
 allowlist, mark digital lines as input or output (not both), choose which
-analog input to stream, and Save. That updates:
+analog input to stream, give the layout a **name**, and Save. That updates:
 
+- a named profile under `.daq_mcp_profiles/` on this PC (gitignored)
 - the MCP allowlist and writable set (what a cloud agent may touch)
 - which lamps/toggles the dashboard shows
 - the live stream target (restarted on save)
 
-Persistence is local only (`.daq_mcp_wiring.json`). The driver still cannot
-detect that a pin is an LED vs a button — you are asserting that.
+Load and Delete switch or remove profiles without touching the repo. The
+driver still cannot detect that a pin is an LED vs a button — you are
+asserting that. MCP tools: `list_wiring_profiles`, `load_wiring_profile`,
+`delete_wiring_profile`, `get_wiring`, `set_wiring`.
 
 ### Only one server at a time
 

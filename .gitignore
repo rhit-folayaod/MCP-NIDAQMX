@@ -16,6 +16,6 @@ build/
 .cursor/mcp.json
 **/mcp.local.json
 
-# Bench wiring chosen in the dashboard channel picker (which pins are
-# inputs vs outputs). Machine-specific; never commit.
+# Bench wiring profiles from the dashboard channel picker (machine-specific).
 .daq_mcp_wiring.json
+.daq_mcp_profiles/

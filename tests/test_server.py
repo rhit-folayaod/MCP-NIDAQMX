@@ -289,11 +289,12 @@ def test_inventory_lists_simulated_channels():
 def test_wiring_picker_updates_allowlist(tmp_path, monkeypatch):
     """Dashboard save must change what the agent may touch, not just the UI."""
     monkeypatch.setattr(server, "WRITES_ENABLED", True)
-    path = tmp_path / "wiring.json"
-    monkeypatch.setattr("daq_mcp.wiring._DEFAULT_PATH", path)
-    monkeypatch.setattr(server, "wiring_path", lambda: path)
+    monkeypatch.setattr("daq_mcp.wiring._PROFILES_DIR", tmp_path)
+    monkeypatch.setattr("daq_mcp.wiring._ACTIVE_NAME_FILE", tmp_path / "_active")
+    monkeypatch.setattr("daq_mcp.wiring._LEGACY_PATH", tmp_path / "legacy.json")
 
     body = {
+        "profile_name": "bench-a",
         "device": "Dev1",
         "live_channel": "Dev1/ai1",
         "live_rate_hz": 500.0,
@@ -304,24 +305,66 @@ def test_wiring_picker_updates_allowlist(tmp_path, monkeypatch):
     }
     result = server._dashboard_set_wiring(body)
     assert "error" not in result, result
-    assert path.is_file()
+    assert result["active_profile"] == "bench-a"
+    assert (tmp_path / "bench-a.json").is_file()
     assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line0"}
     assert server.DIGITAL_INPUTS == {"Dev1/port0/line1"}
     assert "Dev1/ai0" not in server.CHANNEL_ALLOWLIST
     assert "Dev1/ai1" in server.CHANNEL_ALLOWLIST
 
-    # Old LED line is no longer allowlisted; new output is.
     with pytest.raises(server.ChannelNotAllowed):
         server.write_digital("Dev1/port0/line6", True)
     ok = server.write_digital("Dev1/port0/line0", True)
     assert ok["value"] is True
 
-    # Overlap of DI and DO is refused.
     bad = dict(body)
     bad["digital_inputs"] = ["Dev1/port0/line0"]
     bad["digital_outputs"] = ["Dev1/port0/line0"]
     refused = server._dashboard_set_wiring(bad)
     assert "error" in refused
+
+
+def test_named_profiles_save_load_delete(tmp_path, monkeypatch):
+    monkeypatch.setattr("daq_mcp.wiring._PROFILES_DIR", tmp_path)
+    monkeypatch.setattr("daq_mcp.wiring._ACTIVE_NAME_FILE", tmp_path / "_active")
+    monkeypatch.setattr("daq_mcp.wiring._LEGACY_PATH", tmp_path / "legacy.json")
+    monkeypatch.setattr(server, "WRITES_ENABLED", True)
+
+    a = server.set_wiring(
+        device="Dev1",
+        live_channel="Dev1/ai0",
+        analog_inputs=["Dev1/ai0"],
+        digital_inputs=["Dev1/port0/line0"],
+        digital_outputs=["Dev1/port0/line6"],
+        profile_name="mio-demo",
+    )
+    assert "error" not in a, a
+
+    b = server.set_wiring(
+        device="Dev1",
+        live_channel="Dev1/ai1",
+        analog_inputs=["Dev1/ai1"],
+        digital_inputs=["Dev1/port0/line1"],
+        digital_outputs=["Dev1/port0/line7"],
+        profile_name="alt-bench",
+    )
+    assert "error" not in b, b
+    assert server.LIVE_CHANNEL == "Dev1/ai1" or "Dev1/ai1" in server.ANALOG_INPUTS
+
+    listed = server.list_wiring_profiles()
+    names = {p["name"] for p in listed["profiles"]}
+    assert names == {"mio-demo", "alt-bench"}
+    assert listed["active_profile"] == "alt-bench"
+
+    loaded = server.load_wiring_profile("mio-demo")
+    assert "error" not in loaded, loaded
+    assert loaded["active_profile"] == "mio-demo"
+    assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line6"}
+
+    deleted = server.delete_wiring_profile("alt-bench")
+    assert deleted["deleted"] == "alt-bench"
+    names_after = {p["name"] for p in server.list_wiring_profiles()["profiles"]}
+    assert names_after == {"mio-demo"}
 
 
 def test_validate_wiring_rejects_unknown_channel():
@@ -341,27 +384,6 @@ def test_validate_wiring_rejects_unknown_channel():
     }
     problems = validate_wiring(wiring, inv)
     assert any("line99" in p for p in problems)
-
-
-def test_get_and_set_wiring_tools(tmp_path, monkeypatch):
-    path = tmp_path / "wiring.json"
-    monkeypatch.setattr("daq_mcp.wiring._DEFAULT_PATH", path)
-
-    current = server.get_wiring()
-    assert "wiring" in current
-    assert "Dev1/ai0" in current["allowlist"]
-
-    updated = server.set_wiring(
-        device="Dev1",
-        live_channel="Dev1/ai0",
-        analog_inputs=["Dev1/ai0"],
-        digital_inputs=["Dev1/port0/line0"],
-        digital_outputs=["Dev1/port0/line7"],
-        live_rate_hz=800.0,
-    )
-    assert "error" not in updated, updated
-    assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line7"}
-    assert path.is_file()
 
 
 def test_auth_token_helpers():

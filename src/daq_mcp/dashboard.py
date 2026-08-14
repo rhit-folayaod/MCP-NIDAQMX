@@ -36,6 +36,9 @@ def create_app(
     config: Callable[[], dict[str, Any]],
     inventory: Callable[[str | None], dict[str, Any]] | None = None,
     set_wiring: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    list_profiles: Callable[[], dict[str, Any]] | None = None,
+    load_profile: Callable[[str], dict[str, Any]] | None = None,
+    delete_profile: Callable[[str], dict[str, Any]] | None = None,
     mcp_app: Any = None,
     auth_token: str | None = None,
 ) -> Starlette:
@@ -119,6 +122,39 @@ def create_app(
         status = 400 if "error" in result else 200
         return JSONResponse(result, status_code=status)
 
+    async def api_profiles(request: Request) -> JSONResponse:
+        if list_profiles is None:
+            return JSONResponse({"error": "Profiles not available"}, status_code=501)
+        return JSONResponse(list_profiles())
+
+    async def api_load_profile(request: Request) -> JSONResponse:
+        if load_profile is None:
+            return JSONResponse({"error": "Profiles not available"}, status_code=501)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Body must be JSON"}, status_code=400)
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "Expected {name: str}"}, status_code=400)
+        result = load_profile(name.strip())
+        status = 400 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
+    async def api_delete_profile(request: Request) -> JSONResponse:
+        if delete_profile is None:
+            return JSONResponse({"error": "Profiles not available"}, status_code=501)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Body must be JSON"}, status_code=400)
+        name = body.get("name") if isinstance(body, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return JSONResponse({"error": "Expected {name: str}"}, status_code=400)
+        result = delete_profile(name.strip())
+        status = 400 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
     routes: list[Any] = [
         Route("/", index),
         Route("/api/config", api_config),
@@ -127,6 +163,9 @@ def create_app(
         Route("/api/digital", api_write_digital, methods=["POST"]),
         Route("/api/inventory", api_inventory),
         Route("/api/wiring", api_wiring, methods=["PUT"]),
+        Route("/api/profiles", api_profiles),
+        Route("/api/profiles/load", api_load_profile, methods=["POST"]),
+        Route("/api/profiles/delete", api_delete_profile, methods=["POST"]),
     ]
 
     if mcp_app is None:
@@ -323,10 +362,18 @@ _PAGE = """<!DOCTYPE html>
   <h2>Channel wiring</h2>
   <div class="note">
     The driver lists every pin the device supports. You choose which ones this
-    server may touch — and which digital lines are inputs vs outputs. Saved
-    locally (not committed); the agent and this dashboard share the same allowlist.
+    server may touch — and which digital lines are inputs vs outputs. Named
+    profiles are saved on this PC (not committed). The agent uses the active
+    profile's allowlist.
   </div>
   <div class="picker-actions" style="margin-top:12px">
+    <label>Saved profiles
+      <select id="w-profiles"></select>
+    </label>
+    <button class="toggle" id="w-load" type="button">Load</button>
+    <button class="toggle" id="w-delete" type="button">Delete</button>
+  </div>
+  <div class="picker-actions">
     <label>Device
       <select id="w-device"></select>
     </label>
@@ -336,7 +383,13 @@ _PAGE = """<!DOCTYPE html>
     <label>Rate (Hz)
       <input id="w-rate" type="number" min="1" step="1" value="1000" style="width:88px">
     </label>
-    <button class="primary" id="w-save" type="button">Save wiring</button>
+  </div>
+  <div class="picker-actions">
+    <label>Save as
+      <input id="w-name" type="text" placeholder="e.g. mioDAQ-demo" style="width:160px"
+        maxlength="64">
+    </label>
+    <button class="primary" id="w-save" type="button">Save profile</button>
   </div>
   <div class="picker-grid" style="margin-top:14px">
     <div class="picker-col">
@@ -388,8 +441,29 @@ async function loadConfig() {
   w.className = "pill" + (cfg.writes_enabled ? "" : " warn");
   draft = Object.assign({}, cfg.wiring || {});
   $("w-rate").value = draft.live_rate_hz || cfg.live_rate_hz || 1000;
+  $("w-name").value = cfg.active_profile || "";
+  fillProfileSelect(cfg.profiles || [], cfg.active_profile);
   buildRows();
   await loadInventory(draft.device);
+}
+
+function fillProfileSelect(profiles, active) {
+  const sel = $("w-profiles");
+  sel.innerHTML = "";
+  if (!profiles.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no saved profiles yet)";
+    sel.appendChild(opt);
+    return;
+  }
+  for (const p of profiles) {
+    const opt = document.createElement("option");
+    opt.value = p.name;
+    opt.textContent = p.name + (p.active || p.name === active ? " (active)" : "");
+    sel.appendChild(opt);
+  }
+  if (active) sel.value = active;
 }
 
 async function loadInventory(device) {
@@ -493,6 +567,7 @@ function fillLiveSelect() {
 
 function collectDraft() {
   return {
+    profile_name: ($("w-name").value || "").trim(),
     device: $("w-device").value,
     live_channel: $("w-live").value,
     live_rate_hz: Number($("w-rate").value),
@@ -507,6 +582,10 @@ $("w-save").onclick = async () => {
   $("w-err").textContent = "";
   $("w-ok").textContent = "";
   const body = collectDraft();
+  if (!body.profile_name) {
+    $("w-err").textContent = "Give the profile a name before saving.";
+    return;
+  }
   try {
     const r = await fetch(withToken("/api/wiring"), {
       method: "PUT",
@@ -519,8 +598,49 @@ $("w-save").onclick = async () => {
       return;
     }
     draft = res.wiring;
-    $("w-ok").textContent = "Saved. Allowlist updated" +
-      (res.live_error ? " (live restart failed: " + res.live_error + ")" : ".");
+    $("w-ok").textContent = "Saved profile '" + (res.active_profile || body.profile_name) + "'." +
+      (res.live_error ? " Live restart failed: " + res.live_error : "");
+    await loadConfig();
+  } catch (e) {
+    $("w-err").textContent = String(e);
+  }
+};
+
+$("w-load").onclick = async () => {
+  $("w-err").textContent = "";
+  $("w-ok").textContent = "";
+  const name = $("w-profiles").value;
+  if (!name) { $("w-err").textContent = "No profile selected."; return; }
+  try {
+    const r = await fetch(withToken("/api/profiles/load"), {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ name }),
+    });
+    const res = await r.json();
+    if (!r.ok) { $("w-err").textContent = res.error || "Load refused"; return; }
+    $("w-ok").textContent = "Loaded profile '" + name + "'.";
+    await loadConfig();
+  } catch (e) {
+    $("w-err").textContent = String(e);
+  }
+};
+
+$("w-delete").onclick = async () => {
+  $("w-err").textContent = "";
+  $("w-ok").textContent = "";
+  const name = $("w-profiles").value;
+  if (!name) { $("w-err").textContent = "No profile selected."; return; }
+  if (!confirm("Delete profile '" + name + "' from this PC?")) return;
+  try {
+    const r = await fetch(withToken("/api/profiles/delete"), {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ name }),
+    });
+    const res = await r.json();
+    if (!r.ok) { $("w-err").textContent = res.error || "Delete refused"; return; }
+    $("w-ok").textContent = "Deleted '" + name + "'.";
     await loadConfig();
   } catch (e) {
     $("w-err").textContent = String(e);

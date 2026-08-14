@@ -90,4 +90,4 @@ AI client (Cursor / cloud agent)
 
 ## Repo
 
-https://github.com/rhit-folayaod/MCP-NIDAQMX
+https://github.com/rhit-folayaod/daq-mcp

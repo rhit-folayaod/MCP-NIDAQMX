@@ -2,6 +2,9 @@
 
 An MCP server that lets an AI coding client talk to NI DAQ hardware.
 
+For a portfolio-oriented stack summary (resume bullets, keywords, architecture),
+see [TECH_STACK.md](TECH_STACK.md).
+
 Most MCP demos wrap APIs or filesystems. This one wraps a data-acquisition
 device: list channels, read voltages, write digital lines, acquire a short
 waveform. That is interesting because the failure modes are physical — a
@@ -56,6 +59,8 @@ That boundary is what makes the server testable and portable.
 | `self_test` | device built-in self-test |
 | `start_live` / `live_status` / `stop_live` | continuous background acquisition |
 | `get_wiring` / `set_wiring` | read or update channel roles (same as the picker) |
+| `list_wiring_profiles` / `load_wiring_profile` / `delete_wiring_profile` | named local wiring layouts |
+| `save_capture` / `list_captures` | snapshot live metrics + samples to disk |
 
 <!-- Demo GIF placeholder: drop a short clip of the dashboard + LED blink here. -->
 

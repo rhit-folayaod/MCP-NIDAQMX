@@ -386,6 +386,19 @@ def test_validate_wiring_rejects_unknown_channel():
     assert any("line99" in p for p in problems)
 
 
+def test_save_capture_writes_metrics(tmp_path, monkeypatch):
+    monkeypatch.setattr("daq_mcp.captures._CAPTURES_DIR", tmp_path)
+    server.start_live("Dev1/ai0", rate_hz=1000.0)
+    _wait_for_samples(min_count=30)
+    result = server.save_capture(label="unit-test", note="pytest")
+    assert "error" not in result, result
+    assert "mean" in result["summary"]
+    assert (tmp_path / f"{result['name']}.json").is_file()
+    listed = server.list_captures()
+    assert any(c["name"] == result["name"] for c in listed["captures"])
+    server.stop_live()
+
+
 def test_auth_token_helpers():
     from daq_mcp.auth import is_loopback_host, tokens_match
 

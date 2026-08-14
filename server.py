@@ -163,17 +163,80 @@ def _load_wiring_at_startup() -> None:
 
 
 def _inventory_for_device(device: str | None = None) -> dict[str, Any]:
+    """Return channel inventory for one device, or a merged view of all devices.
+
+    CompactDAQ puts pins on modules (`cDAQ1Mod8/...`), not the chassis
+    (`cDAQ1`). A demo that mixes AI on one module and DO on another needs the
+    merged inventory — otherwise the picker can only ever see one module.
+    """
     devices = get_backend().list_devices()
     if not devices:
         return {"devices": [], "selected": None}
     names = [d["name"] for d in devices]
-    chosen = device or _current_wiring.device
-    if chosen not in names:
-        chosen = names[0]
-    info = get_backend().describe_device(chosen)
-    if "error" in info:
-        return {"devices": devices, "selected": chosen, "error": info["error"]}
-    return {"devices": devices, "selected": chosen, "inventory": info}
+    requested = device or _current_wiring.device or names[0]
+
+    def _describe(name: str) -> dict[str, Any]:
+        info = get_backend().describe_device(name)
+        return info if "error" not in info else {
+            "name": name,
+            "analog_input_channels": [],
+            "analog_output_channels": [],
+            "digital_input_channels": [],
+            "digital_output_channels": [],
+        }
+
+    def _merge(infos: list[dict[str, Any]], label: str) -> dict[str, Any]:
+        def _cat(key: str) -> list[str]:
+            seen: set[str] = set()
+            out: list[str] = []
+            for info in infos:
+                for ch in info.get(key) or []:
+                    if ch not in seen:
+                        seen.add(ch)
+                        out.append(ch)
+            return out
+
+        return {
+            "name": label,
+            "product_type": "merged",
+            "analog_input_channels": _cat("analog_input_channels"),
+            "analog_output_channels": _cat("analog_output_channels"),
+            "digital_input_channels": _cat("digital_input_channels"),
+            "digital_output_channels": _cat("digital_output_channels"),
+            "modules": [i.get("name") for i in infos],
+        }
+
+    # Explicit "all", unknown name, or a chassis with no local pins → merge.
+    if requested in {"all", "*", "All devices"}:
+        infos = [_describe(n) for n in names]
+        return {
+            "devices": devices,
+            "selected": "all",
+            "inventory": _merge(infos, "all"),
+        }
+
+    if requested not in names:
+        infos = [_describe(n) for n in names]
+        return {
+            "devices": devices,
+            "selected": "all",
+            "inventory": _merge(infos, "all"),
+        }
+
+    info = _describe(requested)
+    empty = not (
+        info.get("analog_input_channels")
+        or info.get("analog_output_channels")
+        or info.get("digital_input_channels")
+        or info.get("digital_output_channels")
+    )
+    if empty and len(names) > 1:
+        # Typical cDAQ chassis entry: name exists, pins live on modules.
+        infos = [_describe(n) for n in names]
+        merged = _merge(infos, requested)
+        return {"devices": devices, "selected": requested, "inventory": merged}
+
+    return {"devices": devices, "selected": requested, "inventory": info}
 
 
 class ChannelNotAllowed(Exception):
@@ -503,6 +566,24 @@ def delete_wiring_profile(name: str) -> dict:
     return _dashboard_delete_profile(name)
 
 
+@mcp.tool
+def save_capture(label: str | None = None, note: str | None = None) -> dict:
+    """Save the current live window (metrics + samples) to a local JSON file.
+
+    Use after a test run so the numbers are not only on screen. Returns the
+    path, a text summary, and the metrics. Files land in .daq_mcp_captures/.
+    """
+    return _dashboard_save_capture({"label": label, "note": note})
+
+
+@mcp.tool
+def list_captures() -> dict:
+    """List recent saved captures on this machine."""
+    from daq_mcp.captures import list_captures as _list
+
+    return {"captures": _list()}
+
+
 def _dashboard_url() -> str | None:
     if not (_dashboard_serving or DASHBOARD_ENABLED):
         return None
@@ -644,6 +725,79 @@ def _dashboard_list_profiles() -> dict:
     }
 
 
+def _dashboard_save_capture(body: dict[str, Any] | None = None) -> dict:
+    from daq_mcp.captures import (
+        build_capture,
+        metrics_text,
+        save_capture_json,
+        samples_to_csv,
+    )
+
+    body = body or {}
+    window = live.export_window()
+    if not window.get("samples"):
+        return {"error": "No samples in the live window yet; wait for the stream."}
+
+    try:
+        capture = build_capture(
+            samples=window["samples"],
+            metrics=window,
+            channel=window.get("channel"),
+            rate_hz=float(window.get("rate_hz") or 0.0),
+            digital_inputs=window.get("digital_inputs") or {},
+            digital_outputs=window.get("digital_outputs") or {},
+            profile=get_active_profile_name(),
+            label=body.get("label") if isinstance(body.get("label"), str) else None,
+            note=body.get("note") if isinstance(body.get("note"), str) else None,
+        )
+        path = save_capture_json(capture)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    except OSError as exc:
+        return {"error": f"Could not save capture: {exc}"}
+
+    # Do not echo tens of thousands of samples back to the browser by default.
+    preview = {
+        k: v for k, v in capture.items() if k != "samples"
+    }
+    preview["samples_preview"] = capture["samples"][:20]
+    preview["samples_omitted"] = max(0, len(capture["samples"]) - 20)
+    return {
+        "ok": True,
+        "path": str(path),
+        "name": capture["name"],
+        "summary": metrics_text(capture),
+        "capture": preview,
+        "csv": samples_to_csv(capture),
+    }
+
+
+def _dashboard_list_captures() -> dict:
+    from daq_mcp.captures import list_captures as _list
+
+    return {"captures": _list()}
+
+
+def _dashboard_get_capture(name: str) -> dict:
+    from daq_mcp.captures import captures_dir, load_capture, metrics_text, samples_to_csv
+
+    try:
+        capture = load_capture(name)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return {"error": str(exc)}
+    preview = {k: v for k, v in capture.items() if k != "samples"}
+    preview["samples_preview"] = (capture.get("samples") or [])[:20]
+    preview["samples_omitted"] = max(0, len(capture.get("samples") or []) - 20)
+    stem = capture.get("name") or name
+    return {
+        "ok": True,
+        "summary": metrics_text(capture),
+        "capture": preview,
+        "csv": samples_to_csv(capture),
+        "path": str(captures_dir() / f"{stem}.json"),
+    }
+
+
 def _build_dashboard_app(mcp_app=None):
     from daq_mcp.dashboard import create_app
 
@@ -656,6 +810,9 @@ def _build_dashboard_app(mcp_app=None):
         list_profiles=_dashboard_list_profiles,
         load_profile=_dashboard_load_profile,
         delete_profile=_dashboard_delete_profile,
+        save_capture=_dashboard_save_capture,
+        list_captures=_dashboard_list_captures,
+        get_capture=_dashboard_get_capture,
         mcp_app=mcp_app,
         auth_token=AUTH_TOKEN,
     )

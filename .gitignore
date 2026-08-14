@@ -20,3 +20,4 @@ build/
 # Bench wiring profiles from the dashboard channel picker (machine-specific).
 .daq_mcp_wiring.json
 .daq_mcp_profiles/
+.daq_mcp_captures/

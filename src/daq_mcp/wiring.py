@@ -296,7 +296,15 @@ def validate_wiring(
             errors.append(f"{ch} is not a digital line on this device")
 
     inv_name = inventory.get("name")
-    if inv_name and wiring.device and wiring.device != inv_name:
+    # Merged / chassis inventories list pins from many modules; the profile's
+    # device field is just a label in that case.
+    if (
+        inv_name
+        and wiring.device
+        and wiring.device != inv_name
+        and inv_name not in {"all", "*", "merged"}
+        and inventory.get("product_type") != "merged"
+    ):
         errors.append(
             f"device {wiring.device!r} does not match inventory device {inv_name!r}"
         )

@@ -280,6 +280,28 @@ class LiveMonitor:
             **stats,
         }
 
+    def export_window(self) -> dict[str, Any]:
+        """Full rolling window + metrics for saving a test result."""
+        with self._lock:
+            samples = list(self._samples)
+            channel = self._channel
+            rate_hz = self._rate_hz
+            total = self._total_samples
+            digital_in = dict(self._digital_inputs)
+            digital_out = dict(self._digital_outputs)
+        stats = summarize(samples)
+        return {
+            "channel": channel,
+            "rate_hz": rate_hz,
+            "total_samples": total,
+            "window_samples": len(samples),
+            "latest": samples[-1] if samples else None,
+            "samples": samples,
+            "digital_inputs": digital_in,
+            "digital_outputs": digital_out,
+            **stats,
+        }
+
 
 def _downsample(samples: list[float], max_points: int) -> list[float]:
     n = len(samples)

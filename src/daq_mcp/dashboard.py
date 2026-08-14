@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 
 logger = logging.getLogger("daq-mcp")
@@ -39,6 +39,9 @@ def create_app(
     list_profiles: Callable[[], dict[str, Any]] | None = None,
     load_profile: Callable[[str], dict[str, Any]] | None = None,
     delete_profile: Callable[[str], dict[str, Any]] | None = None,
+    save_capture: Callable[[dict[str, Any] | None], dict[str, Any]] | None = None,
+    list_captures: Callable[[], dict[str, Any]] | None = None,
+    get_capture: Callable[[str], dict[str, Any]] | None = None,
     mcp_app: Any = None,
     auth_token: str | None = None,
 ) -> Starlette:
@@ -155,6 +158,48 @@ def create_app(
         status = 400 if "error" in result else 200
         return JSONResponse(result, status_code=status)
 
+    async def api_capture(request: Request) -> JSONResponse:
+        if save_capture is None:
+            return JSONResponse({"error": "Captures not available"}, status_code=501)
+        try:
+            body = await request.json() if request.method == "POST" else {}
+        except Exception:
+            body = {}
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+        result = save_capture(body)
+        status = 400 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
+    async def api_captures(request: Request) -> JSONResponse:
+        if list_captures is None:
+            return JSONResponse({"error": "Captures not available"}, status_code=501)
+        return JSONResponse(list_captures())
+
+    async def api_get_capture(request: Request) -> JSONResponse:
+        if get_capture is None:
+            return JSONResponse({"error": "Captures not available"}, status_code=501)
+        name = request.path_params.get("name") or ""
+        result = get_capture(name)
+        status = 404 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
+    async def api_download_capture(request: Request) -> Response:
+        from daq_mcp.captures import captures_dir
+
+        name = request.path_params.get("name") or ""
+        stem = name[:-5] if name.endswith(".json") else name
+        path = captures_dir() / f"{stem}.json"
+        if not path.is_file():
+            return JSONResponse({"error": f"No capture named {name!r}"}, status_code=404)
+        return FileResponse(
+            path,
+            media_type="application/json",
+            filename=path.name,
+        )
+
     routes: list[Any] = [
         Route("/", index),
         Route("/api/config", api_config),
@@ -166,6 +211,10 @@ def create_app(
         Route("/api/profiles", api_profiles),
         Route("/api/profiles/load", api_load_profile, methods=["POST"]),
         Route("/api/profiles/delete", api_delete_profile, methods=["POST"]),
+        Route("/api/capture", api_capture, methods=["POST"]),
+        Route("/api/captures", api_captures),
+        Route("/api/captures/{name}", api_get_capture),
+        Route("/api/captures/{name}/download", api_download_capture),
     ]
 
     if mcp_app is None:
@@ -317,6 +366,20 @@ _PAGE = """<!DOCTYPE html>
     border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px;
   }
   button.primary:hover { border-color: var(--accent); }
+  details.capture-box {
+    margin-top: 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: #0f141c; padding: 8px 12px;
+  }
+  details.capture-box summary {
+    cursor: pointer; color: var(--muted); font-size: 12px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  #capture-text {
+    width: 100%; min-height: 160px; margin-top: 8px; resize: vertical;
+    background: #0b0f14; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #capture-list { margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -356,6 +419,34 @@ _PAGE = """<!DOCTYPE html>
       <div class="note">Polled live. Read-only by design.</div>
     </div>
   </div>
+</div>
+
+<div class="panel" style="margin-top:16px">
+  <h2>Save test data</h2>
+  <div class="note">
+    Snapshot the current live window (metrics + samples) to this PC, then
+    expand the summary or download JSON / CSV. The agent can also call
+    <code>save_capture</code>.
+  </div>
+  <div class="picker-actions" style="margin-top:12px">
+    <label>Label
+      <input id="c-label" type="text" placeholder="e.g. blink-test" style="width:160px" maxlength="64">
+    </label>
+    <label>Note
+      <input id="c-note" type="text" placeholder="optional" style="width:220px" maxlength="200">
+    </label>
+    <button class="primary" id="c-save" type="button">Capture now</button>
+    <button class="toggle" id="c-dl-json" type="button" disabled>Download JSON</button>
+    <button class="toggle" id="c-dl-csv" type="button" disabled>Download CSV</button>
+  </div>
+  <details class="capture-box" id="c-details">
+    <summary>Metrics summary (expand)</summary>
+    <textarea id="capture-text" readonly placeholder="Capture a run to see metrics here."></textarea>
+  </details>
+  <div class="note" id="c-path"></div>
+  <div class="err" id="c-err"></div>
+  <div class="ok" id="c-ok"></div>
+  <div id="capture-list"></div>
 </div>
 
 <div class="panel picker">
@@ -483,14 +574,19 @@ function fillDeviceSelect() {
   const sel = $("w-device");
   const devices = inventoryPack.devices || [];
   sel.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = "all";
+  all.textContent = "All devices (cDAQ modules, etc.)";
+  sel.appendChild(all);
   for (const d of devices) {
     const opt = document.createElement("option");
     opt.value = d.name;
     opt.textContent = d.name + " (" + (d.product_type || "?") + ")";
     sel.appendChild(opt);
   }
-  const want = (draft && draft.device) || inventoryPack.selected;
-  if (want) sel.value = want;
+  const want = (draft && draft.device) || inventoryPack.selected || "all";
+  sel.value = want;
+  if (sel.value !== want) sel.value = "all";
   sel.onchange = () => {
     draft.device = sel.value;
     loadInventory(sel.value);
@@ -647,6 +743,104 @@ $("w-delete").onclick = async () => {
   }
 };
 
+let lastCapture = null;
+
+function downloadBlob(filename, text, mime) {
+  const blob = new Blob([text], { type: mime });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function showCapture(res) {
+  lastCapture = res;
+  $("capture-text").value = res.summary || "";
+  $("c-details").open = true;
+  $("c-path").textContent = res.path ? ("Saved on this PC: " + res.path) : "";
+  $("c-dl-json").disabled = false;
+  $("c-dl-csv").disabled = !res.csv;
+  refreshCaptureList();
+}
+
+async function refreshCaptureList() {
+  try {
+    const r = await fetch(withToken("/api/captures"), { headers: authHeaders() });
+    const res = await r.json();
+    const box = $("capture-list");
+    box.innerHTML = "";
+    const items = res.captures || [];
+    if (!items.length) {
+      box.innerHTML = '<div class="note">No saved captures yet.</div>';
+      return;
+    }
+    for (const c of items.slice(0, 8)) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML =
+        '<span class="chan">' + c.name + '</span>' +
+        '<button class="toggle" type="button" data-cap="' + c.name + '">Open</button>';
+      box.appendChild(row);
+    }
+    box.querySelectorAll("button[data-cap]").forEach((b) => {
+      b.onclick = () => openCapture(b.dataset.cap);
+    });
+  } catch (e) {
+    /* ignore list refresh errors */
+  }
+}
+
+async function openCapture(name) {
+  $("c-err").textContent = "";
+  try {
+    const r = await fetch(withToken("/api/captures/" + encodeURIComponent(name)), {
+      headers: authHeaders(),
+    });
+    const res = await r.json();
+    if (!r.ok) { $("c-err").textContent = res.error || "Could not open"; return; }
+    showCapture(res);
+    $("c-ok").textContent = "Loaded " + name;
+  } catch (e) {
+    $("c-err").textContent = String(e);
+  }
+}
+
+$("c-save").onclick = async () => {
+  $("c-err").textContent = "";
+  $("c-ok").textContent = "";
+  try {
+    const r = await fetch(withToken("/api/capture"), {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        label: ($("c-label").value || "").trim() || null,
+        note: ($("c-note").value || "").trim() || null,
+      }),
+    });
+    const res = await r.json();
+    if (!r.ok) { $("c-err").textContent = res.error || "Capture failed"; return; }
+    showCapture(res);
+    $("c-ok").textContent = "Captured " + res.name;
+  } catch (e) {
+    $("c-err").textContent = String(e);
+  }
+};
+
+$("c-dl-json").onclick = () => {
+  if (!lastCapture || !lastCapture.name) return;
+  window.location.href = withToken(
+    "/api/captures/" + encodeURIComponent(lastCapture.name) + "/download"
+  );
+};
+
+$("c-dl-csv").onclick = () => {
+  if (!lastCapture || !lastCapture.csv) return;
+  downloadBlob((lastCapture.name || "capture") + ".csv", lastCapture.csv, "text/csv");
+};
+
+loadConfig().then(() => { connect(); refreshCaptureList(); });
+
 function buildRows() {
   const out = $("outputs");
   out.innerHTML = "";
@@ -778,8 +972,6 @@ function connect() {
     es.close(); setTimeout(connect, 1500);
   };
 }
-
-loadConfig().then(connect);
 </script>
 </body>
 </html>

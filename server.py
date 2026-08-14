@@ -17,12 +17,13 @@ import math
 import os
 import sys
 import threading
-from typing import Literal
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 from daq_mcp.backend import get_backend
 from daq_mcp.live import LiveMonitor
+from daq_mcp.wiring import Wiring, load_wiring, save_wiring, validate_wiring, wiring_path
 
 mcp = FastMCP("daq-mcp")
 
@@ -41,14 +42,18 @@ mcp = FastMCP("daq-mcp")
 # Rule 3 exists because direction is a physical fact, not a preference. Driving
 # a line that a button also drives shorts one driver against the other. Listing
 # channels by direction means "this is an input" is enforced, not remembered.
+#
+# The defaults below match one USB-6421 bench. Override them from the dashboard
+# channel picker; choices land in .daq_mcp_wiring.json (gitignored).
 # --------------------------------------------------------------------------
 
 WRITES_ENABLED = os.getenv("DAQ_MCP_ALLOW_WRITE") == "1"
 
-ANALOG_INPUTS = {"Dev1/ai0", "Dev1/ai1"}
-ANALOG_OUTPUTS: set[str] = set()
-DIGITAL_INPUTS = {"Dev1/port0/line0", "Dev1/port0/line1"}  # buttons
-DIGITAL_OUTPUTS = {"Dev1/port0/line6", "Dev1/port0/line7"}  # LEDs
+_DEFAULT_WIRING = Wiring()
+ANALOG_INPUTS = set(_DEFAULT_WIRING.analog_inputs)
+ANALOG_OUTPUTS = set(_DEFAULT_WIRING.analog_outputs)
+DIGITAL_INPUTS = set(_DEFAULT_WIRING.digital_inputs)
+DIGITAL_OUTPUTS = set(_DEFAULT_WIRING.digital_outputs)
 
 CHANNEL_ALLOWLIST = ANALOG_INPUTS | ANALOG_OUTPUTS | DIGITAL_INPUTS | DIGITAL_OUTPUTS
 WRITABLE_CHANNELS = ANALOG_OUTPUTS | DIGITAL_OUTPUTS
@@ -60,12 +65,80 @@ AO_VOLTAGE_LIMITS = (-5.0, 5.0)
 DASHBOARD_ENABLED = os.getenv("DAQ_MCP_DASHBOARD") == "1"
 DASHBOARD_HOST = os.getenv("DAQ_MCP_DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT = int(os.getenv("DAQ_MCP_DASHBOARD_PORT", "8765"))
-LIVE_CHANNEL = os.getenv("DAQ_MCP_LIVE_CHANNEL", "Dev1/ai0")
-LIVE_RATE_HZ = float(os.getenv("DAQ_MCP_LIVE_RATE", "1000"))
+# Shared secret for --http / non-loopback binds. Empty means open (loopback only).
+AUTH_TOKEN = os.getenv("DAQ_MCP_TOKEN", "").strip() or None
+# Env vars win over the wiring file so a one-off launch can override without
+# editing the picker. The file wins over the hardcoded bench defaults.
+LIVE_CHANNEL = os.getenv("DAQ_MCP_LIVE_CHANNEL") or _DEFAULT_WIRING.live_channel
+LIVE_RATE_HZ = float(os.getenv("DAQ_MCP_LIVE_RATE") or _DEFAULT_WIRING.live_rate_hz)
 
 _PREVIEW_MAX_POINTS = 50
 
 live = LiveMonitor(get_backend)
+_wiring_lock = threading.Lock()
+_current_wiring = _DEFAULT_WIRING
+# True once the HTTP dashboard is actually listening (env flag alone is not enough
+# for --dashboard-only / --http).
+_dashboard_serving = False
+
+
+def _apply_wiring(wiring: Wiring, *, restart_live: bool = False) -> dict[str, Any]:
+    """Install wiring into the module-level allowlists the tools consult."""
+    global ANALOG_INPUTS, ANALOG_OUTPUTS, DIGITAL_INPUTS, DIGITAL_OUTPUTS
+    global CHANNEL_ALLOWLIST, WRITABLE_CHANNELS, LIVE_CHANNEL, LIVE_RATE_HZ
+    global _current_wiring
+
+    with _wiring_lock:
+        ANALOG_INPUTS = set(wiring.analog_inputs)
+        ANALOG_OUTPUTS = set(wiring.analog_outputs)
+        DIGITAL_INPUTS = set(wiring.digital_inputs)
+        DIGITAL_OUTPUTS = set(wiring.digital_outputs)
+        CHANNEL_ALLOWLIST = (
+            ANALOG_INPUTS | ANALOG_OUTPUTS | DIGITAL_INPUTS | DIGITAL_OUTPUTS
+        )
+        WRITABLE_CHANNELS = ANALOG_OUTPUTS | DIGITAL_OUTPUTS
+        # Env override still wins for the live channel/rate if set.
+        LIVE_CHANNEL = os.getenv("DAQ_MCP_LIVE_CHANNEL") or wiring.live_channel
+        LIVE_RATE_HZ = float(os.getenv("DAQ_MCP_LIVE_RATE") or wiring.live_rate_hz)
+        _current_wiring = wiring
+
+    result: dict[str, Any] = {"ok": True, "wiring": wiring.to_dict()}
+    if restart_live:
+        if live.is_streaming():
+            live.stop()
+        started = live.start(
+            LIVE_CHANNEL, LIVE_RATE_HZ, poll_inputs=sorted(DIGITAL_INPUTS)
+        )
+        if "error" in started:
+            result["live_error"] = started["error"]
+        else:
+            result["live"] = started
+    return result
+
+
+def _load_wiring_at_startup() -> None:
+    try:
+        wiring = load_wiring()
+    except ValueError as exc:
+        logging.getLogger("daq-mcp").warning("ignoring wiring file: %s", exc)
+        return
+    _apply_wiring(wiring, restart_live=False)
+    if wiring_path().is_file():
+        logging.getLogger("daq-mcp").info("loaded wiring from %s", wiring_path())
+
+
+def _inventory_for_device(device: str | None = None) -> dict[str, Any]:
+    devices = get_backend().list_devices()
+    if not devices:
+        return {"devices": [], "selected": None}
+    names = [d["name"] for d in devices]
+    chosen = device or _current_wiring.device
+    if chosen not in names:
+        chosen = names[0]
+    info = get_backend().describe_device(chosen)
+    if "error" in info:
+        return {"devices": devices, "selected": chosen, "error": info["error"]}
+    return {"devices": devices, "selected": chosen, "inventory": info}
 
 
 class ChannelNotAllowed(Exception):
@@ -330,10 +403,59 @@ def live_status() -> dict:
     return snap
 
 
+@mcp.tool
+def get_wiring() -> dict:
+    """Return the active channel roles (inputs vs outputs) and live stream target.
+
+    Same data the dashboard channel picker shows. Does not invent what is
+    physically wired — only what this server is currently allowed to touch.
+    """
+    with _wiring_lock:
+        wiring = _current_wiring.to_dict()
+    return {
+        "wiring": wiring,
+        "path": str(wiring_path()),
+        "file_exists": wiring_path().is_file(),
+        "allowlist": sorted(CHANNEL_ALLOWLIST),
+        "writable": sorted(WRITABLE_CHANNELS),
+    }
+
+
+@mcp.tool
+def set_wiring(
+    device: str,
+    live_channel: str,
+    analog_inputs: list[str],
+    digital_inputs: list[str],
+    digital_outputs: list[str],
+    analog_outputs: list[str] | None = None,
+    live_rate_hz: float = 1000.0,
+) -> dict:
+    """Update channel roles and persist them to the local wiring file.
+
+    Use this when the bench changes and the dashboard is not open. A digital
+    line cannot be both input and output. Live acquisition restarts on success
+    so the agent and dashboard stay on the same allowlist.
+    """
+    body = {
+        "device": device,
+        "live_channel": live_channel,
+        "live_rate_hz": live_rate_hz,
+        "analog_inputs": analog_inputs,
+        "analog_outputs": list(analog_outputs or []),
+        "digital_inputs": digital_inputs,
+        "digital_outputs": digital_outputs,
+    }
+    return _dashboard_set_wiring(body)
+
+
 def _dashboard_url() -> str | None:
-    if not DASHBOARD_ENABLED:
+    if not (_dashboard_serving or DASHBOARD_ENABLED):
         return None
-    return f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/"
+    base = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/"
+    if AUTH_TOKEN:
+        return f"{base}?token=…"
+    return base
 
 
 # --------------------------------------------------------------------------
@@ -386,35 +508,98 @@ def _dashboard_set_digital(channel: str, value: bool) -> dict:
 
 
 def _dashboard_config() -> dict:
+    with _wiring_lock:
+        wiring = _current_wiring.to_dict()
     return {
         "backend": type(get_backend()).__name__,
         "writes_enabled": WRITES_ENABLED,
         "digital_inputs": sorted(DIGITAL_INPUTS),
         "digital_outputs": sorted(DIGITAL_OUTPUTS),
         "analog_inputs": sorted(ANALOG_INPUTS),
+        "analog_outputs": sorted(ANALOG_OUTPUTS),
         "ao_voltage_limits": list(AO_VOLTAGE_LIMITS),
+        "live_channel": LIVE_CHANNEL,
+        "live_rate_hz": LIVE_RATE_HZ,
+        "wiring": wiring,
+        "wiring_file": str(wiring_path()),
     }
 
 
-def _start_dashboard() -> bool:
-    from daq_mcp.dashboard import create_app, port_is_free, serve_in_thread
+def _dashboard_inventory(device: str | None = None) -> dict:
+    return _inventory_for_device(device)
 
-    log = logging.getLogger("daq-mcp")
-    if not port_is_free(DASHBOARD_HOST, DASHBOARD_PORT):
-        log.error(
-            "dashboard port %d is already in use (another server still running?); "
-            "set DAQ_MCP_DASHBOARD_PORT to pick another",
-            DASHBOARD_PORT,
-        )
-        return False
 
-    app = create_app(
+def _dashboard_set_wiring(body: dict[str, Any]) -> dict:
+    try:
+        wiring = Wiring.from_dict(body)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    inv_pack = _inventory_for_device(wiring.device)
+    inventory = inv_pack.get("inventory")
+    problems = validate_wiring(wiring, inventory)
+    if problems:
+        return {"error": "; ".join(problems), "problems": problems}
+
+    try:
+        path = save_wiring(wiring)
+    except OSError as exc:
+        return {"error": f"Could not save wiring: {exc}"}
+
+    applied = _apply_wiring(wiring, restart_live=True)
+    applied["path"] = str(path)
+    return applied
+
+
+def _build_dashboard_app(mcp_app=None):
+    from daq_mcp.dashboard import create_app
+
+    return create_app(
         snapshot=lambda: live.snapshot(max_points=400),
         set_digital=_dashboard_set_digital,
         config=_dashboard_config,
+        inventory=_dashboard_inventory,
+        set_wiring=_dashboard_set_wiring,
+        mcp_app=mcp_app,
+        auth_token=AUTH_TOKEN,
     )
-    serve_in_thread(app, DASHBOARD_HOST, DASHBOARD_PORT)
-    log.info("dashboard on http://%s:%d/", DASHBOARD_HOST, DASHBOARD_PORT)
+
+
+def _dashboard_port_available() -> bool:
+    from daq_mcp.auth import is_loopback_host
+    from daq_mcp.dashboard import port_is_free
+
+    if not is_loopback_host(DASHBOARD_HOST) and not AUTH_TOKEN:
+        logging.getLogger("daq-mcp").error(
+            "DAQ_MCP_DASHBOARD_HOST=%s is not loopback; set DAQ_MCP_TOKEN "
+            "before exposing the dashboard / MCP HTTP endpoint",
+            DASHBOARD_HOST,
+        )
+        return False
+    if port_is_free(DASHBOARD_HOST, DASHBOARD_PORT):
+        return True
+    logging.getLogger("daq-mcp").error(
+        "dashboard port %d is already in use (another server still running?); "
+        "set DAQ_MCP_DASHBOARD_PORT to pick another",
+        DASHBOARD_PORT,
+    )
+    return False
+
+
+def _start_dashboard() -> bool:
+    global _dashboard_serving
+    from daq_mcp.dashboard import serve_in_thread
+
+    if not _dashboard_port_available():
+        return False
+    serve_in_thread(_build_dashboard_app(), DASHBOARD_HOST, DASHBOARD_PORT)
+    _dashboard_serving = True
+    logging.getLogger("daq-mcp").info(
+        "dashboard on http://%s:%d/%s",
+        DASHBOARD_HOST,
+        DASHBOARD_PORT,
+        " (token required)" if AUTH_TOKEN else "",
+    )
     return True
 
 
@@ -423,18 +608,22 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     log = logging.getLogger("daq-mcp")
 
-    # Standalone dashboard: no MCP client, no stdio loop. Without this the
-    # stdio transport reads EOF on an unattached stdin and exits immediately,
-    # taking the dashboard with it.
+    # Three ways to run, because a DAQ device belongs to one process at a time
+    # and different clients need to reach that one process differently:
+    #   (default)         stdio MCP, for an editor that launches this itself
+    #   --dashboard-only  browser only, no MCP client attached
+    #   --http            dashboard and MCP on one port, so Inspector and a
+    #                     browser (and an editor) can all attach at once
     dashboard_only = "--dashboard-only" in sys.argv
+    http_mode = "--http" in sys.argv
 
     # NI-DAQmx must be probed on the main thread. FastMCP runs sync tools in a
     # worker thread; lazy backend init there can deadlock on Windows over stdio.
     backend = get_backend()
     log.info("backend=%s writes_enabled=%s", type(backend).__name__, WRITES_ENABLED)
+    _load_wiring_at_startup()
 
-    if DASHBOARD_ENABLED or dashboard_only:
-        _start_dashboard()
+    def start_live_acquisition() -> None:
         # Start streaming immediately so the dashboard has a trace on open,
         # rather than requiring the model to call start_live first.
         started = live.start(
@@ -443,7 +632,36 @@ if __name__ == "__main__":
         if "error" in started:
             log.warning("live acquisition did not start: %s", started["error"])
 
-    if dashboard_only:
+    if http_mode:
+        import uvicorn
+
+        if not _dashboard_port_available():
+            sys.exit(1)
+        start_live_acquisition()
+        app = _build_dashboard_app(mcp_app=mcp.http_app(path="/"))
+        _dashboard_serving = True
+        log.info(
+            "dashboard on http://%s:%d/ | MCP endpoint http://%s:%d/mcp/%s",
+            DASHBOARD_HOST,
+            DASHBOARD_PORT,
+            DASHBOARD_HOST,
+            DASHBOARD_PORT,
+            " (token required)" if AUTH_TOKEN else "",
+        )
+        try:
+            uvicorn.run(
+                app,
+                host=DASHBOARD_HOST,
+                port=DASHBOARD_PORT,
+                log_level="warning",
+                access_log=False,
+            )
+        finally:
+            live.stop()
+
+    elif dashboard_only:
+        _start_dashboard()
+        start_live_acquisition()
         log.info("dashboard-only mode; Ctrl+C to stop")
         try:
             threading.Event().wait()
@@ -451,5 +669,9 @@ if __name__ == "__main__":
             pass
         finally:
             live.stop()
+
     else:
+        if DASHBOARD_ENABLED:
+            _start_dashboard()
+            start_live_acquisition()
         mcp.run()

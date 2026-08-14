@@ -276,3 +276,111 @@ def test_dashboard_config_reports_directions():
     assert cfg["digital_outputs"] == ["Dev1/port0/line6"]
     assert "Dev1/port0/line0" in cfg["digital_inputs"]
     assert cfg["writes_enabled"] is False
+
+
+def test_inventory_lists_simulated_channels():
+    pack = server._dashboard_inventory("Dev1")
+    assert pack["selected"] == "Dev1"
+    inv = pack["inventory"]
+    assert "Dev1/ai0" in inv["analog_input_channels"]
+    assert any("port0/line" in ch for ch in inv["digital_input_channels"])
+
+
+def test_wiring_picker_updates_allowlist(tmp_path, monkeypatch):
+    """Dashboard save must change what the agent may touch, not just the UI."""
+    monkeypatch.setattr(server, "WRITES_ENABLED", True)
+    path = tmp_path / "wiring.json"
+    monkeypatch.setattr("daq_mcp.wiring._DEFAULT_PATH", path)
+    monkeypatch.setattr(server, "wiring_path", lambda: path)
+
+    body = {
+        "device": "Dev1",
+        "live_channel": "Dev1/ai1",
+        "live_rate_hz": 500.0,
+        "analog_inputs": ["Dev1/ai1"],
+        "analog_outputs": [],
+        "digital_inputs": ["Dev1/port0/line1"],
+        "digital_outputs": ["Dev1/port0/line0"],
+    }
+    result = server._dashboard_set_wiring(body)
+    assert "error" not in result, result
+    assert path.is_file()
+    assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line0"}
+    assert server.DIGITAL_INPUTS == {"Dev1/port0/line1"}
+    assert "Dev1/ai0" not in server.CHANNEL_ALLOWLIST
+    assert "Dev1/ai1" in server.CHANNEL_ALLOWLIST
+
+    # Old LED line is no longer allowlisted; new output is.
+    with pytest.raises(server.ChannelNotAllowed):
+        server.write_digital("Dev1/port0/line6", True)
+    ok = server.write_digital("Dev1/port0/line0", True)
+    assert ok["value"] is True
+
+    # Overlap of DI and DO is refused.
+    bad = dict(body)
+    bad["digital_inputs"] = ["Dev1/port0/line0"]
+    bad["digital_outputs"] = ["Dev1/port0/line0"]
+    refused = server._dashboard_set_wiring(bad)
+    assert "error" in refused
+
+
+def test_validate_wiring_rejects_unknown_channel():
+    from daq_mcp.wiring import Wiring, validate_wiring
+
+    wiring = Wiring(
+        analog_inputs=["Dev1/ai0"],
+        live_channel="Dev1/ai0",
+        digital_outputs=["Dev1/port0/line99"],
+    )
+    inv = {
+        "name": "Dev1",
+        "analog_input_channels": ["Dev1/ai0"],
+        "analog_output_channels": [],
+        "digital_input_channels": ["Dev1/port0/line0"],
+        "digital_output_channels": ["Dev1/port0/line0"],
+    }
+    problems = validate_wiring(wiring, inv)
+    assert any("line99" in p for p in problems)
+
+
+def test_get_and_set_wiring_tools(tmp_path, monkeypatch):
+    path = tmp_path / "wiring.json"
+    monkeypatch.setattr("daq_mcp.wiring._DEFAULT_PATH", path)
+
+    current = server.get_wiring()
+    assert "wiring" in current
+    assert "Dev1/ai0" in current["allowlist"]
+
+    updated = server.set_wiring(
+        device="Dev1",
+        live_channel="Dev1/ai0",
+        analog_inputs=["Dev1/ai0"],
+        digital_inputs=["Dev1/port0/line0"],
+        digital_outputs=["Dev1/port0/line7"],
+        live_rate_hz=800.0,
+    )
+    assert "error" not in updated, updated
+    assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line7"}
+    assert path.is_file()
+
+
+def test_auth_token_helpers():
+    from daq_mcp.auth import is_loopback_host, tokens_match
+
+    assert is_loopback_host("127.0.0.1")
+    assert is_loopback_host("localhost")
+    assert not is_loopback_host("0.0.0.0")
+    assert tokens_match("secret", "secret")
+    assert tokens_match("Bearer secret", "secret")
+    assert not tokens_match("nope", "secret")
+
+
+def test_non_loopback_requires_token(monkeypatch):
+    monkeypatch.setattr(server, "DASHBOARD_HOST", "0.0.0.0")
+    monkeypatch.setattr(server, "AUTH_TOKEN", None)
+    assert server._dashboard_port_available() is False
+
+    monkeypatch.setattr(server, "AUTH_TOKEN", "test-secret")
+    # Port may or may not be free; we only care that the token gate passed.
+    # If something is listening, still False — either way no crash.
+    server._dashboard_port_available()

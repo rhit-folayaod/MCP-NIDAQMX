@@ -21,7 +21,7 @@ from typing import Any, Callable
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 logger = logging.getLogger("daq-mcp")
 
@@ -34,11 +34,33 @@ def create_app(
     snapshot: Callable[[], dict[str, Any]],
     set_digital: Callable[[str, bool], dict[str, Any]],
     config: Callable[[], dict[str, Any]],
+    inventory: Callable[[str | None], dict[str, Any]] | None = None,
+    set_wiring: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    mcp_app: Any = None,
+    auth_token: str | None = None,
 ) -> Starlette:
-    """Build the dashboard app around server-supplied, safety-checked hooks."""
+    """Build the dashboard app around server-supplied, safety-checked hooks.
+
+    Passing `mcp_app` mounts the MCP endpoint at /mcp on the same port, so a
+    client like MCP Inspector attaches to this running process instead of
+    spawning its own — which would fight this one for the device.
+
+    `auth_token`, when set, gates every route. Required for non-loopback binds.
+    """
 
     async def index(request: Request) -> HTMLResponse:
-        return HTMLResponse(_PAGE)
+        # Embed a token from ?token= so the page can authorize EventSource
+        # (which cannot set Authorization headers) without a second login UI.
+        page = _PAGE
+        q = request.query_params.get("token")
+        if q:
+            safe = json.dumps(q)
+            page = page.replace(
+                "let AUTH_TOKEN = sessionStorage.getItem('daq_token') || '';",
+                f"let AUTH_TOKEN = {safe}; sessionStorage.setItem('daq_token', AUTH_TOKEN);",
+                1,
+            )
+        return HTMLResponse(page)
 
     async def api_config(request: Request) -> JSONResponse:
         return JSONResponse(config())
@@ -78,15 +100,48 @@ def create_app(
         status = 403 if "error" in result else 200
         return JSONResponse(result, status_code=status)
 
-    return Starlette(
-        routes=[
-            Route("/", index),
-            Route("/api/config", api_config),
-            Route("/api/state", api_state),
-            Route("/api/stream", api_stream),
-            Route("/api/digital", api_write_digital, methods=["POST"]),
-        ]
-    )
+    async def api_inventory(request: Request) -> JSONResponse:
+        if inventory is None:
+            return JSONResponse({"error": "Inventory not available"}, status_code=501)
+        device = request.query_params.get("device")
+        return JSONResponse(inventory(device))
+
+    async def api_wiring(request: Request) -> JSONResponse:
+        if set_wiring is None:
+            return JSONResponse({"error": "Wiring not available"}, status_code=501)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Body must be JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "Body must be a JSON object"}, status_code=400)
+        result = set_wiring(body)
+        status = 400 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
+    routes: list[Any] = [
+        Route("/", index),
+        Route("/api/config", api_config),
+        Route("/api/state", api_state),
+        Route("/api/stream", api_stream),
+        Route("/api/digital", api_write_digital, methods=["POST"]),
+        Route("/api/inventory", api_inventory),
+        Route("/api/wiring", api_wiring, methods=["PUT"]),
+    ]
+
+    if mcp_app is None:
+        app = Starlette(routes=routes)
+    else:
+        # The MCP app carries its own lifespan (session manager startup). Mounting
+        # without handing that to the parent leaves the endpoint dead on arrival.
+        routes.append(Mount("/mcp", app=mcp_app))
+        app = Starlette(routes=routes, lifespan=mcp_app.lifespan)
+
+    if auth_token:
+        from daq_mcp.auth import TokenAuthMiddleware
+
+        app.add_middleware(TokenAuthMiddleware, token=auth_token)
+    return app
 
 
 def port_is_free(host: str, port: int) -> bool:
@@ -193,6 +248,36 @@ _PAGE = """<!DOCTYPE html>
   button.toggle:disabled { opacity: .45; cursor: not-allowed; }
   .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
   .err { color: var(--danger); font-size: 12px; margin-top: 10px; min-height: 16px; }
+  .ok { color: var(--on); font-size: 12px; margin-top: 10px; min-height: 16px; }
+  .picker { margin-top: 16px; }
+  .picker-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+  }
+  .picker-col h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 8px; font-weight: 600;
+  }
+  .pick-list {
+    max-height: 180px; overflow: auto; border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 8px; background: #0f141c;
+  }
+  .pick-list label {
+    display: flex; gap: 8px; align-items: center; padding: 4px 0;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
+  }
+  .picker-actions {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px;
+  }
+  select, input[type="number"] {
+    background: #1b2431; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px;
+  }
+  button.primary {
+    border: 1px solid #2ea043; background: #17492a; color: var(--text);
+    border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 12px;
+  }
+  button.primary:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -234,21 +319,213 @@ _PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="panel picker">
+  <h2>Channel wiring</h2>
+  <div class="note">
+    The driver lists every pin the device supports. You choose which ones this
+    server may touch — and which digital lines are inputs vs outputs. Saved
+    locally (not committed); the agent and this dashboard share the same allowlist.
+  </div>
+  <div class="picker-actions" style="margin-top:12px">
+    <label>Device
+      <select id="w-device"></select>
+    </label>
+    <label>Stream
+      <select id="w-live"></select>
+    </label>
+    <label>Rate (Hz)
+      <input id="w-rate" type="number" min="1" step="1" value="1000" style="width:88px">
+    </label>
+    <button class="primary" id="w-save" type="button">Save wiring</button>
+  </div>
+  <div class="picker-grid" style="margin-top:14px">
+    <div class="picker-col">
+      <h3>Analog inputs</h3>
+      <div class="pick-list" id="pick-ai"></div>
+    </div>
+    <div class="picker-col">
+      <h3>Analog outputs</h3>
+      <div class="pick-list" id="pick-ao"></div>
+    </div>
+    <div class="picker-col">
+      <h3>Digital inputs</h3>
+      <div class="pick-list" id="pick-di"></div>
+    </div>
+    <div class="picker-col">
+      <h3>Digital outputs</h3>
+      <div class="pick-list" id="pick-do"></div>
+    </div>
+  </div>
+  <div class="err" id="w-err"></div>
+  <div class="ok" id="w-ok"></div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const fmt = (v, d = 3) => (v === null || v === undefined) ? "--" : Number(v).toFixed(d);
 
+let AUTH_TOKEN = sessionStorage.getItem('daq_token') || '';
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (AUTH_TOKEN) h["Authorization"] = "Bearer " + AUTH_TOKEN;
+  return h;
+}
+function withToken(url) {
+  if (!AUTH_TOKEN) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(AUTH_TOKEN);
+}
+
 let cfg = { digital_outputs: [], digital_inputs: [], writes_enabled: false, backend: "?" };
 let outState = {};
+let inventoryPack = null;
+let draft = null;
 
 async function loadConfig() {
-  cfg = await (await fetch("/api/config")).json();
+  cfg = await (await fetch(withToken("/api/config"), { headers: authHeaders() })).json();
   $("p-backend").textContent = cfg.backend;
   const w = $("p-writes");
   w.textContent = cfg.writes_enabled ? "writes enabled" : "writes disabled";
   w.className = "pill" + (cfg.writes_enabled ? "" : " warn");
+  draft = Object.assign({}, cfg.wiring || {});
+  $("w-rate").value = draft.live_rate_hz || cfg.live_rate_hz || 1000;
   buildRows();
+  await loadInventory(draft.device);
 }
+
+async function loadInventory(device) {
+  const q = device ? ("?device=" + encodeURIComponent(device)) : "";
+  inventoryPack = await (await fetch(withToken("/api/inventory" + q), { headers: authHeaders() })).json();
+  if (inventoryPack.error && !inventoryPack.inventory) {
+    $("w-err").textContent = inventoryPack.error;
+    return;
+  }
+  $("w-err").textContent = "";
+  fillDeviceSelect();
+  fillChannelLists();
+  fillLiveSelect();
+}
+
+function fillDeviceSelect() {
+  const sel = $("w-device");
+  const devices = inventoryPack.devices || [];
+  sel.innerHTML = "";
+  for (const d of devices) {
+    const opt = document.createElement("option");
+    opt.value = d.name;
+    opt.textContent = d.name + " (" + (d.product_type || "?") + ")";
+    sel.appendChild(opt);
+  }
+  const want = (draft && draft.device) || inventoryPack.selected;
+  if (want) sel.value = want;
+  sel.onchange = () => {
+    draft.device = sel.value;
+    loadInventory(sel.value);
+  };
+}
+
+function checkedSet(id) {
+  return new Set(
+    Array.from(document.querySelectorAll("#" + id + " input:checked")).map((el) => el.value)
+  );
+}
+
+function fillChannelLists() {
+  const inv = inventoryPack.inventory || {};
+  const ai = inv.analog_input_channels || [];
+  const ao = inv.analog_output_channels || [];
+  const di = inv.digital_input_channels || [];
+  const dout = inv.digital_output_channels || [];
+  // Boards often list the same DIO under both DI and DO.
+  const dio = Array.from(new Set([...di, ...dout])).sort();
+
+  renderChecks("pick-ai", ai, new Set(draft.analog_inputs || []), () => fillLiveSelect());
+  renderChecks("pick-ao", ao, new Set(draft.analog_outputs || []));
+  renderChecks("pick-di", dio, new Set(draft.digital_inputs || []), syncDigitalExclusive);
+  renderChecks("pick-do", dio, new Set(draft.digital_outputs || []), syncDigitalExclusive);
+}
+
+function renderChecks(containerId, channels, selected, onChange) {
+  const box = $(containerId);
+  box.innerHTML = "";
+  if (!channels.length) {
+    box.innerHTML = '<div class="note">None on this device.</div>';
+    return;
+  }
+  for (const ch of channels) {
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = ch;
+    cb.checked = selected.has(ch);
+    if (onChange) cb.onchange = onChange;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(ch));
+    box.appendChild(label);
+  }
+}
+
+function syncDigitalExclusive(ev) {
+  // A line cannot be both input and output in our safety model.
+  const ch = ev.target.value;
+  const asInput = ev.target.closest("#pick-di") !== null;
+  const other = document.querySelector(
+    (asInput ? "#pick-do" : "#pick-di") + ' input[value="' + CSS.escape(ch) + '"]'
+  );
+  if (ev.target.checked && other) other.checked = false;
+}
+
+function fillLiveSelect() {
+  const sel = $("w-live");
+  const selectedAi = Array.from(checkedSet("pick-ai"));
+  const fallback = draft.analog_inputs || [];
+  const options = selectedAi.length ? selectedAi : fallback;
+  sel.innerHTML = "";
+  for (const ch of options) {
+    const opt = document.createElement("option");
+    opt.value = ch;
+    opt.textContent = ch;
+    sel.appendChild(opt);
+  }
+  const want = draft.live_channel || cfg.live_channel;
+  if (want && options.includes(want)) sel.value = want;
+  else if (options.length) sel.value = options[0];
+}
+
+function collectDraft() {
+  return {
+    device: $("w-device").value,
+    live_channel: $("w-live").value,
+    live_rate_hz: Number($("w-rate").value),
+    analog_inputs: Array.from(checkedSet("pick-ai")),
+    analog_outputs: Array.from(checkedSet("pick-ao")),
+    digital_inputs: Array.from(checkedSet("pick-di")),
+    digital_outputs: Array.from(checkedSet("pick-do")),
+  };
+}
+
+$("w-save").onclick = async () => {
+  $("w-err").textContent = "";
+  $("w-ok").textContent = "";
+  const body = collectDraft();
+  try {
+    const r = await fetch(withToken("/api/wiring"), {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    const res = await r.json();
+    if (!r.ok) {
+      $("w-err").textContent = res.error || "Save refused";
+      return;
+    }
+    draft = res.wiring;
+    $("w-ok").textContent = "Saved. Allowlist updated" +
+      (res.live_error ? " (live restart failed: " + res.live_error + ")" : ".");
+    await loadConfig();
+  } catch (e) {
+    $("w-err").textContent = String(e);
+  }
+};
 
 function buildRows() {
   const out = $("outputs");
@@ -294,9 +571,9 @@ async function toggle(ch) {
   const next = !outState[ch];
   $("out-err").textContent = "";
   try {
-    const r = await fetch("/api/digital", {
+    const r = await fetch(withToken("/api/digital"), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ channel: ch, value: next }),
     });
     const body = await r.json();
@@ -373,7 +650,7 @@ function render(s) {
 }
 
 function connect() {
-  const es = new EventSource("/api/stream");
+  const es = new EventSource(withToken("/api/stream"));
   es.onopen = () => { $("p-conn").textContent = "connected"; $("p-conn").className = "pill live"; };
   es.onmessage = (e) => render(JSON.parse(e.data));
   es.onerror = () => {

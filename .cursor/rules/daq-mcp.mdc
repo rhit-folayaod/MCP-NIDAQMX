@@ -39,5 +39,10 @@ timing, error types). Do not invent method names or parameter shapes from
 memory — plausible-looking wrong calls fail only on hardware.
 
 If a call is uncertain, say so and look it up. Prefer one Task per operation,
-created and closed inside the call. Catch `nidaqmx.errors.DaqError` and return
-a structured `{error, error_code}` dict instead of leaking a traceback.
+created and closed inside the call, for every *snapshot* tool. Continuous
+acquisition (`start_stream` / `LiveMonitor`) is the deliberate exception: one
+long-lived task owned by the monitor thread, with snapshot tools reading that
+channel from the buffer instead of opening a competing task. Catch
+`nidaqmx.errors.DaqError` and return a structured `{error, error_code}` dict
+instead of leaking a traceback — except inside the stream drain path, where
+only "samples not ready yet" is ignored and every other code stops the monitor.

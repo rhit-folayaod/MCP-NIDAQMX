@@ -15,3 +15,7 @@ build/
 # Machine-local MCP launch config (paths, write-enable flags). Keep examples.
 .cursor/mcp.json
 **/mcp.local.json
+
+# Bench wiring chosen in the dashboard channel picker (which pins are
+# inputs vs outputs). Machine-specific; never commit.
+.daq_mcp_wiring.json

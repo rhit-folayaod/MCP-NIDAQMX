@@ -1,0 +1,50 @@
+name: Bug report
+description: Report unexpected behavior in daq-mcp
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Redact tokens, tunnel URLs, and machine-local paths.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Expected vs actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, env vars (redact secrets), and MCP client if relevant.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Simulated (`DAQ_MCP_SIMULATE=1`)
+        - Real NI-DAQmx
+        - Unsure
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device (if real hardware)
+      placeholder: e.g. USB-6421, cDAQ-9178 + modules
+  - type: input
+    id: env
+    attributes:
+      label: OS / Python
+      placeholder: e.g. Windows 11, Python 3.11
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error codes
+      description: Startup backend line, traceback, or DAQmx error numbers.
+      render: text

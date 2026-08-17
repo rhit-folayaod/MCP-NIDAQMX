@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/absolute/path/to/MCP-NIDAQMX",
+        "/absolute/path/to/daq-mcp",
         "server.py"
       ],
       "env": {

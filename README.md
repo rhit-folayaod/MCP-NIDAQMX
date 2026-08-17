@@ -1,16 +1,19 @@
 # daq-mcp
 
-An MCP server that lets an AI coding client talk to NI DAQ hardware.
+Personal project: an MCP server that lets an AI coding client talk to NI DAQ
+hardware. Built to learn MCP and to explore what a safety model looks like when
+the failure modes are physical (bad channel names, conflicting drivers, stray
+analog voltages), not just HTTP status codes.
 
-For a portfolio-oriented stack summary (resume bullets, keywords, architecture),
-see [TECH_STACK.md](TECH_STACK.md).
+Not affiliated with, endorsed by, or supported by NI / Emerson. Licensed under
+the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+For portfolio-oriented stack notes, see [TECH_STACK.md](TECH_STACK.md).
 
 Most MCP demos wrap APIs or filesystems. This one wraps a data-acquisition
 device: list channels, read voltages, write digital lines, acquire a short
-waveform. That is interesting because the failure modes are physical — a
-hallucinated channel name or a stray analog output can damage equipment or
-hurt someone. The protocol plumbing is the easy part; the safety model is
-the point of the project.
+waveform. The protocol plumbing is the easy part; the safety model is the point
+of the project.
 
 ## Safety model
 
@@ -23,21 +26,19 @@ its own actions.
 | Control | Default | Env / constant |
 | --- | --- | --- |
 | Digital / analog writes | disabled | `DAQ_MCP_ALLOW_WRITE=1` |
-| Readable channels | `ANALOG_INPUTS` + `DIGITAL_INPUTS` + `DIGITAL_OUTPUTS` | `server.py` |
-| Writable channels | `DIGITAL_OUTPUTS` + `ANALOG_OUTPUTS` | `WRITABLE_CHANNELS` in `server.py` |
+| Readable channels | `ANALOG_INPUTS` + `DIGITAL_INPUTS` + `DIGITAL_OUTPUTS` | `server.py` / wiring profiles |
+| Writable channels | `DIGITAL_OUTPUTS` + `ANALOG_OUTPUTS` | derived from output groups |
 | AO clamp range | ±5 V | `AO_VOLTAGE_LIMITS` in `server.py` |
 
 Direction is enforced, not just documented. Channels are declared by direction
 and the writable set is derived from the output groups, so a line wired to a
-button is readable but cannot be driven. That is not pedantry: driving a line
-that a button also drives puts two drivers in opposition, which is a short.
+button is readable but cannot be driven. Driving a line that a button also
+drives puts two drivers in opposition.
 
-The defaults in `server.py` describe one particular bench (a USB-6421 with
-two buttons and two LEDs). Prefer the **dashboard channel picker**: it loads
-the connected device's full inventory and lets you mark which lines are
-inputs vs outputs. Choices are saved to `.daq_mcp_wiring.json` (gitignored)
-and applied to the same allowlist the agent uses — so a phone-prompted agent
-and the laptop dashboard stay in sync.
+The defaults in `server.py` describe one particular USB-6421 bench. Prefer the
+**dashboard channel picker**: it loads the connected device's inventory and lets
+you mark inputs vs outputs. Named layouts save under `.daq_mcp_profiles/`
+(gitignored) and apply to the same allowlist the agent uses.
 
 An allowlist that does not describe your hardware protects nothing. Never
 enable writes until the wiring matches the bench.
@@ -61,6 +62,10 @@ That boundary is what makes the server testable and portable.
 | `get_wiring` / `set_wiring` | read or update channel roles (same as the picker) |
 | `list_wiring_profiles` / `load_wiring_profile` / `delete_wiring_profile` | named local wiring layouts |
 | `save_capture` / `list_captures` | snapshot live metrics + samples to disk |
+
+Voltage AI/AO tools assume voltage-capable channels. Specialized CompactDAQ
+modules (strain, thermocouple, IEPE, etc.) need different DAQmx APIs and will
+error if you treat them as plain voltage lines.
 
 <!-- Demo GIF placeholder: drop a short clip of the dashboard + LED blink here. -->
 
@@ -95,8 +100,8 @@ and skips the MCP loop entirely.
 
 ### Unified HTTP mode (dashboard + MCP on one port)
 
-Inspector normally *spawns* its own server process, which steals the device from
-a running dashboard. `--http` serves both on one process instead:
+MCP Inspector normally *spawns* its own server process, which steals the device
+from a running dashboard. `--http` serves both on one process instead:
 
 ```powershell
 $env:DAQ_MCP_ALLOW_WRITE="1"
@@ -201,7 +206,8 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-cd MCP-NIDAQMX
+git clone https://github.com/rhit-folayaod/daq-mcp.git
+cd daq-mcp
 uv sync
 ```
 
@@ -227,7 +233,7 @@ DAQ_MCP_ALLOW_WRITE=1   # enable digital / analog output
 ## Verify with MCP Inspector
 
 ```bash
-cd MCP-NIDAQMX
+cd daq-mcp
 DAQ_MCP_SIMULATE=1 npx -y @modelcontextprotocol/inspector uv run server.py
 ```
 
@@ -236,7 +242,7 @@ setting it in the shell — Inspector spawns the server with a sanitized
 environment and does not forward arbitrary shell variables:
 
 ```powershell
-cd path\to\MCP-NIDAQMX
+cd path\to\daq-mcp
 npx -y @modelcontextprotocol/inspector -e DAQ_MCP_SIMULATE=1 uv run server.py
 ```
 
@@ -257,7 +263,7 @@ to `uv` so Cursor does not depend on PATH:
       "args": [
         "run",
         "--directory",
-        "C:\\path\\to\\MCP-NIDAQMX",
+        "C:\\path\\to\\daq-mcp",
         "server.py"
       ],
       "env": {
@@ -310,7 +316,13 @@ src/daq_mcp/backend/      # DAQBackend ABC, simulated + nidaqmx backends
 src/daq_mcp/live.py       # continuous acquisition thread + rolling window
 src/daq_mcp/dashboard.py  # Starlette app, SSE stream, single-page UI
 src/daq_mcp/wiring.py     # local channel-role config for the picker
-src/daq_mcp/auth.py      # optional shared-secret gate for HTTP mode
+src/daq_mcp/captures.py   # snapshot save/list helpers
+src/daq_mcp/auth.py       # optional shared-secret gate for HTTP mode
 tests/                    # pytest against the simulator
 .github/workflows/ci.yml  # simulator pytest on push
+LICENSE / NOTICE          # Apache 2.0 + attribution
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports welcome via GitHub Issues.

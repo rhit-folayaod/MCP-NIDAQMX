@@ -91,3 +91,6 @@ AI client (Cursor / cloud agent)
 ## Repo
 
 https://github.com/rhit-folayaod/daq-mcp
+
+License: Apache 2.0 (`LICENSE` / `NOTICE`). Personal project; not affiliated
+with NI / Emerson.

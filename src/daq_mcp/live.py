@@ -33,6 +33,8 @@ import time
 from collections import deque
 from typing import Any, Callable
 
+from daq_mcp.measurements import AiOptions
+
 logger = logging.getLogger("daq-mcp")
 
 # How often the monitor drains the hardware buffer. Fast enough to feel live,
@@ -113,6 +115,7 @@ class LiveMonitor:
         self._total_samples: int = 0
         self._error: str | None = None
         self._failed: bool = False
+        self._options: AiOptions = AiOptions()
 
         # Digital state. Inputs are polled; outputs are cached on write, since
         # reading an output line back would require reconfiguring it.
@@ -128,18 +131,21 @@ class LiveMonitor:
         rate_hz: float,
         *,
         poll_inputs: list[str] | None = None,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
+        opts = options or AiOptions()
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return {"error": f"Already streaming {self._channel!r}"}
 
-            result = self._get_backend().start_stream(channel, rate_hz)
+            result = self._get_backend().start_stream(channel, rate_hz, options=opts)
             if "error" in result:
                 return result
 
             self._samples.clear()
             self._channel = channel
-            self._rate_hz = rate_hz
+            self._rate_hz = float(result.get("rate_hz", rate_hz))
+            self._options = opts
             self._total_samples = 0
             self._error = None
             self._failed = False
@@ -155,8 +161,17 @@ class LiveMonitor:
         # A snapshot cached from the previous session would otherwise be served
         # as if it belonged to this one.
         self._invalidate_cache()
-        logger.info("live monitor started on %s at %.0f Hz", channel, rate_hz)
-        return {"channel": channel, "rate_hz": rate_hz}
+        logger.info(
+            "live monitor started on %s at %.0f Hz (%s)",
+            channel,
+            self._rate_hz,
+            opts.measurement,
+        )
+        return {
+            "channel": channel,
+            "rate_hz": self._rate_hz,
+            **opts.meta(),
+        }
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
@@ -172,6 +187,7 @@ class LiveMonitor:
             channel = self._channel
             self._channel = None
             self._rate_hz = 0.0
+            self._options = AiOptions()
         logger.info("live monitor stopped (%s)", channel)
         return result
 
@@ -185,6 +201,11 @@ class LiveMonitor:
     def rate_hz(self) -> float:
         with self._lock:
             return self._rate_hz
+
+    @property
+    def options(self) -> AiOptions:
+        with self._lock:
+            return self._options
 
     def _invalidate_cache(self) -> None:
         with self._cache_lock:
@@ -278,6 +299,7 @@ class LiveMonitor:
             error = self._error
             digital_in = dict(self._digital_inputs)
             digital_out = dict(self._digital_outputs)
+            opts = self._options
 
         stats = summarize(samples)
         return {
@@ -291,6 +313,7 @@ class LiveMonitor:
             "latest": samples[-1] if samples else None,
             "digital_inputs": digital_in,
             "digital_outputs": digital_out,
+            **opts.meta(),
             **stats,
         }
 
@@ -303,6 +326,7 @@ class LiveMonitor:
             total = self._total_samples
             digital_in = dict(self._digital_inputs)
             digital_out = dict(self._digital_outputs)
+            opts = self._options
         stats = summarize(samples)
         return {
             "channel": channel,
@@ -313,6 +337,7 @@ class LiveMonitor:
             "samples": samples,
             "digital_inputs": digital_in,
             "digital_outputs": digital_out,
+            **opts.meta(),
             **stats,
         }
 

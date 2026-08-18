@@ -497,7 +497,7 @@ _PAGE = """<!DOCTYPE html>
   </div>
   <div class="picker-actions">
     <label>Save as
-      <input id="w-name" type="text" placeholder="e.g. mioDAQ-demo" style="width:160px"
+      <input id="w-name" type="text" placeholder="e.g. lab-bench" style="width:160px"
         maxlength="64">
     </label>
     <button class="primary" id="w-save" type="button">Save profile</button>
@@ -962,11 +962,12 @@ function render(s) {
   ch.className = "pill" + (s.streaming ? " live" : " warn");
   $("acq-err").textContent = s.error ? "Acquisition stopped: " + s.error : "";
 
-  $("s-latest").textContent = fmt(s.latest) + " V";
-  $("s-mean").textContent = fmt(s.mean);
-  $("s-rms").textContent = fmt(s.rms);
-  $("s-p2p").textContent = fmt(s.peak_to_peak);
-  $("s-std").textContent = fmt(s.std_dev, 4);
+  const unit = s.units ? (" " + s.units) : "";
+  $("s-latest").textContent = fmt(s.latest) + unit;
+  $("s-mean").textContent = fmt(s.mean) + unit;
+  $("s-rms").textContent = fmt(s.rms) + unit;
+  $("s-p2p").textContent = fmt(s.peak_to_peak) + unit;
+  $("s-std").textContent = fmt(s.std_dev, 4) + unit;
   $("s-total").textContent = s.total_samples.toLocaleString();
 
   outState = s.digital_outputs || {};

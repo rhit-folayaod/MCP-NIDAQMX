@@ -26,6 +26,7 @@ import time
 from typing import Any
 
 from daq_mcp.backend.base import DAQBackend, TerminalConfig
+from daq_mcp.measurements import AiOptions
 
 # Tunables — keep these easy to find and tweak.
 SINE_FREQUENCY_HZ = 1.0
@@ -86,6 +87,7 @@ class SimulatedBackend(DAQBackend):
         self._stream_channel: str | None = None
         self._stream_rate_hz: float = 0.0
         self._stream_last_read: float = 0.0
+        self._stream_options: AiOptions = AiOptions()
 
     def list_devices(self) -> list[dict[str, Any]]:
         result = []
@@ -129,18 +131,23 @@ class SimulatedBackend(DAQBackend):
         samples: int,
         rate_hz: float,
         terminal_config: TerminalConfig,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
+        opts = options or AiOptions(terminal_config=terminal_config)
         if samples < 1:
             return {"error": "samples must be >= 1"}
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
 
-        values = self._generate_ai(channel, samples, rate_hz)
+        rate = opts.clamp_rate(rate_hz)
+        values = self._generate_ai(channel, samples, rate, opts)
         return {
             "channel": channel,
             "samples": values,
-            "rate_hz": rate_hz,
+            "rate_hz": rate,
             "terminal_config": terminal_config,
+            **opts.meta(),
             **_stats(values),
         }
 
@@ -164,20 +171,25 @@ class SimulatedBackend(DAQBackend):
         channel: str,
         duration_s: float,
         rate_hz: float,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
+        opts = options or AiOptions()
         if duration_s <= 0:
             return {"error": "duration_s must be > 0"}
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
 
-        n = max(1, int(round(duration_s * rate_hz)))
-        values = self._generate_ai(channel, n, rate_hz)
+        rate = opts.clamp_rate(rate_hz)
+        n = max(1, int(round(duration_s * rate)))
+        values = self._generate_ai(channel, n, rate, opts)
         return {
             "channel": channel,
             "samples": values,
-            "rate_hz": rate_hz,
+            "rate_hz": rate,
             "duration_s": duration_s,
             "sample_count": n,
+            **opts.meta(),
         }
 
     def self_test(self, device: str) -> dict[str, Any]:
@@ -189,17 +201,26 @@ class SimulatedBackend(DAQBackend):
             }
         return {"device": device, "passed": True}
 
-    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+    def start_stream(
+        self,
+        channel: str,
+        rate_hz: float,
+        *,
+        options: AiOptions | None = None,
+    ) -> dict[str, Any]:
+        opts = options or AiOptions()
         if self._stream_channel is not None:
             return {
                 "error": f"Already streaming {self._stream_channel!r}; stop it first"
             }
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
+        rate = opts.clamp_rate(rate_hz)
         self._stream_channel = channel
-        self._stream_rate_hz = rate_hz
+        self._stream_rate_hz = rate
         self._stream_last_read = time.monotonic()
-        return {"channel": channel, "rate_hz": rate_hz}
+        self._stream_options = opts
+        return {"channel": channel, "rate_hz": rate, **opts.meta()}
 
     def read_stream(self, max_samples: int = 10_000) -> list[float]:
         if self._stream_channel is None:
@@ -213,19 +234,29 @@ class SimulatedBackend(DAQBackend):
             return []
         n = min(n, max_samples)
         self._stream_last_read += n / self._stream_rate_hz
-        return self._generate_ai(self._stream_channel, n, self._stream_rate_hz)
+        return self._generate_ai(
+            self._stream_channel, n, self._stream_rate_hz, self._stream_options
+        )
 
     def stop_stream(self) -> dict[str, Any]:
         channel = self._stream_channel
         self._stream_channel = None
         self._stream_rate_hz = 0.0
+        self._stream_options = AiOptions()
         return {"stopped": channel}
 
     def streaming_channel(self) -> str | None:
         return self._stream_channel
 
-    def _generate_ai(self, channel: str, n: int, rate_hz: float) -> list[float]:
-        """ai0-style: slow sine. ai1-style: noisy DC. Others: noisy DC at 0 V."""
+    def _generate_ai(
+        self,
+        channel: str,
+        n: int,
+        rate_hz: float,
+        options: AiOptions | None = None,
+    ) -> list[float]:
+        """ai0-style: slow sine. ai1-style: noisy DC. Scale by measurement kind."""
+        opts = options or AiOptions()
         t_start = time.monotonic() - self._t0
         dt = 1.0 / rate_hz
         values: list[float] = []
@@ -245,5 +276,13 @@ class SimulatedBackend(DAQBackend):
                 v = DC_LEVEL_V + noise
             else:
                 v = noise
+
+            if opts.measurement == "strain":
+                # Map the fake sine into a small strain band around 0.002.
+                v = 0.002 + 0.0002 * math.sin(2.0 * math.pi * 0.5 * t) + noise * 1e-4
+            elif opts.measurement == "thermocouple":
+                v = 22.0 + 0.3 * math.sin(2.0 * math.pi * 0.05 * t) + noise * 0.05
+            elif opts.measurement == "accelerometer":
+                v = 0.1 * math.sin(2.0 * math.pi * 60.0 * t) + noise * 0.02
             values.append(v)
         return values

@@ -14,7 +14,7 @@
 
 """Optional shared-secret gate for the HTTP dashboard / MCP endpoint.
 
-Loopback demos need no token. Binding beyond localhost without one would
+Loopback binds need no token. Binding beyond localhost without one would
 expose a write-capable DAQ server to the LAN, so the server refuses to start
 in that configuration unless DAQ_MCP_TOKEN is set.
 """

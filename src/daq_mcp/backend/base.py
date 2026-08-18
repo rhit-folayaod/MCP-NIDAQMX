@@ -23,6 +23,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, Literal
 
+from daq_mcp.measurements import AiOptions
+
 TerminalConfig = Literal["default", "rse", "nrse", "diff"]
 
 
@@ -44,8 +46,10 @@ class DAQBackend(ABC):
         samples: int,
         rate_hz: float,
         terminal_config: TerminalConfig,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
-        """Acquire voltage samples and return them with min/mean/max."""
+        """Acquire analog samples (voltage / strain / TC / accel) with min/mean/max."""
 
     @abstractmethod
     def read_digital(self, channel: str) -> dict[str, Any]:
@@ -65,6 +69,8 @@ class DAQBackend(ABC):
         channel: str,
         duration_s: float,
         rate_hz: float,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
         """Finite timed acquisition; return samples for the tool to summarize."""
 
@@ -83,7 +89,13 @@ class DAQBackend(ABC):
     # ----------------------------------------------------------------------
 
     @abstractmethod
-    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+    def start_stream(
+        self,
+        channel: str,
+        rate_hz: float,
+        *,
+        options: AiOptions | None = None,
+    ) -> dict[str, Any]:
         """Begin continuous acquisition on one channel.
 
         Returns {"channel", "rate_hz"} on success or {"error"} on failure.

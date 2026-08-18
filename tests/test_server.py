@@ -86,6 +86,30 @@ def test_read_analog_well_formed():
     assert result["channel"] == "Dev1/ai0"
     assert len(result["samples"]) == 10
     assert "min" in result and "mean" in result and "max" in result
+    assert result.get("measurement") == "voltage"
+
+
+def test_specialty_measurements_on_simulator():
+    strain = server.read_analog(
+        "Dev1/ai0", samples=20, rate_hz=200.0, measurement="strain"
+    )
+    assert "error" not in strain, strain
+    assert strain["units"] == "strain"
+    assert abs(strain["mean"] - 0.002) < 0.001
+
+    tc = server.monitor_analog(
+        "Dev1/ai0", duration_s=0.2, rate_hz=50.0, measurement="thermocouple"
+    )
+    assert "error" not in tc, tc
+    assert tc["units"] == "deg_C"
+    assert 15.0 < tc["mean"] < 30.0
+
+    accel = server.monitor_analog(
+        "Dev1/ai0", duration_s=0.05, rate_hz=2000.0, measurement="accelerometer"
+    )
+    assert "error" not in accel, accel
+    assert accel["units"] == "g"
+    assert "preview" in accel
 
 
 def test_read_digital_well_formed():
@@ -349,7 +373,7 @@ def test_named_profiles_save_load_delete(tmp_path, monkeypatch):
         analog_inputs=["Dev1/ai0"],
         digital_inputs=["Dev1/port0/line0"],
         digital_outputs=["Dev1/port0/line6"],
-        profile_name="mio-demo",
+        profile_name="bench-a",
     )
     assert "error" not in a, a
 
@@ -366,18 +390,18 @@ def test_named_profiles_save_load_delete(tmp_path, monkeypatch):
 
     listed = server.list_wiring_profiles()
     names = {p["name"] for p in listed["profiles"]}
-    assert names == {"mio-demo", "alt-bench"}
+    assert names == {"bench-a", "alt-bench"}
     assert listed["active_profile"] == "alt-bench"
 
-    loaded = server.load_wiring_profile("mio-demo")
+    loaded = server.load_wiring_profile("bench-a")
     assert "error" not in loaded, loaded
-    assert loaded["active_profile"] == "mio-demo"
+    assert loaded["active_profile"] == "bench-a"
     assert server.DIGITAL_OUTPUTS == {"Dev1/port0/line6"}
 
     deleted = server.delete_wiring_profile("alt-bench")
     assert deleted["deleted"] == "alt-bench"
     names_after = {p["name"] for p in server.list_wiring_profiles()["profiles"]}
-    assert names_after == {"mio-demo"}
+    assert names_after == {"bench-a"}
 
 
 def test_validate_wiring_rejects_unknown_channel():

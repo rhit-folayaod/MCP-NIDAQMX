@@ -34,6 +34,12 @@ import threading
 from typing import Any, Callable, TypeVar
 
 from daq_mcp.backend.base import DAQBackend, TerminalConfig
+from daq_mcp.measurements import (
+    DEFAULT_ACCEL_EXCIT_A,
+    DEFAULT_GAGE_RESISTANCE,
+    AiOptions,
+    suggest_measurement,
+)
 
 T = TypeVar("T")
 
@@ -93,6 +99,7 @@ class NIDAQmxBackend(DAQBackend):
         self._stream_task: Any = None
         self._stream_channel: str | None = None
         self._stream_lock = threading.Lock()
+        self._stream_options: AiOptions = AiOptions()
 
     def _terminal(self, terminal_config: TerminalConfig):
         from nidaqmx.constants import TerminalConfiguration
@@ -103,6 +110,107 @@ class NIDAQmxBackend(DAQBackend):
             "nrse": TerminalConfiguration.NRSE,
             "diff": TerminalConfiguration.DIFF,
         }[terminal_config]
+
+    def _configure_ai(self, task: Any, channel: str, options: AiOptions) -> None:
+        """Create the right DAQmx AI channel type for this measurement."""
+        from nidaqmx.constants import (
+            AccelSensitivityUnits,
+            AccelUnits,
+            CJCSource,
+            ExcitationSource,
+            StrainGageBridgeType,
+            StrainUnits,
+            TemperatureUnits,
+            ThermocoupleType,
+        )
+
+        if options.measurement == "voltage":
+            task.ai_channels.add_ai_voltage_chan(
+                channel,
+                terminal_config=self._terminal(options.terminal_config),
+                min_val=-10.0,
+                max_val=10.0,
+            )
+            return
+
+        if options.measurement == "strain":
+            # CompactDAQ strain modules commonly use quarter-bridge wiring.
+            # Full/half configs are rejected by some modules (e.g. NI 9236).
+            task.ai_channels.add_ai_strain_gage_chan(
+                channel,
+                min_val=-0.005,
+                max_val=0.005,
+                units=StrainUnits.STRAIN,
+                strain_config=StrainGageBridgeType.QUARTER_BRIDGE_I,
+                voltage_excit_source=ExcitationSource.INTERNAL,
+                voltage_excit_val=float(options.strain_excit_v),
+                gage_factor=float(options.gage_factor),
+                nominal_gage_resistance=DEFAULT_GAGE_RESISTANCE,
+            )
+            return
+
+        if options.measurement == "thermocouple":
+            tc_map = {
+                "J": ThermocoupleType.J,
+                "K": ThermocoupleType.K,
+                "T": ThermocoupleType.T,
+                "E": ThermocoupleType.E,
+                "N": ThermocoupleType.N,
+                "R": ThermocoupleType.R,
+                "S": ThermocoupleType.S,
+                "B": ThermocoupleType.B,
+            }
+            task.ai_channels.add_ai_thrmcpl_chan(
+                channel,
+                min_val=-20.0,
+                max_val=120.0,
+                units=TemperatureUnits.DEG_C,
+                thermocouple_type=tc_map[options.thermocouple_type],
+                cjc_source=CJCSource.BUILT_IN,
+            )
+            return
+
+        if options.measurement == "accelerometer":
+            # NI 9234 IEPE path. DEFAULT terminal config is required on this
+            # module; PSEUDODIFF/DIFF are rejected.
+            task.ai_channels.add_ai_accel_chan(
+                channel,
+                terminal_config=self._terminal("default"),
+                min_val=-50.0,
+                max_val=50.0,
+                units=AccelUnits.G,
+                sensitivity=float(options.accel_sensitivity_mv_per_g),
+                sensitivity_units=AccelSensitivityUnits.MILLIVOLTS_PER_G,
+                current_excit_source=ExcitationSource.INTERNAL,
+                current_excit_val=DEFAULT_ACCEL_EXCIT_A,
+            )
+            return
+
+        raise ValueError(f"Unsupported measurement {options.measurement!r}")
+
+    def _finite_read(
+        self,
+        channel: str,
+        samples: int,
+        rate_hz: float,
+        options: AiOptions,
+    ) -> list[float]:
+        """Always use a sample clock — DSA modules (9234) reject on-demand reads."""
+        import nidaqmx
+        from nidaqmx.constants import AcquisitionType
+
+        n = max(1, int(samples))
+        rate = max(1.0, options.clamp_rate(rate_hz))
+        with nidaqmx.Task() as task:
+            self._configure_ai(task, channel, options)
+            task.timing.cfg_samp_clk_timing(
+                rate=rate,
+                sample_mode=AcquisitionType.FINITE,
+                samps_per_chan=n,
+            )
+            timeout = max(10.0, n / rate + 5.0)
+            raw = task.read(number_of_samples_per_channel=n, timeout=timeout)
+        return _as_float_list(raw)
 
     def list_devices(self) -> list[dict[str, Any]]:
         from nidaqmx.errors import DaqError
@@ -142,9 +250,11 @@ class NIDAQmxBackend(DAQBackend):
             dev = self._System.local().devices[device]
             ai_rng = _safe(lambda: list(dev.ai_voltage_rngs), [])
             ao_rng = _safe(lambda: list(dev.ao_voltage_rngs), [])
+            product = _safe(lambda: dev.product_type, "")
+            suggested = suggest_measurement(product)
             return {
                 "name": dev.name,
-                "product_type": _safe(lambda: dev.product_type, ""),
+                "product_type": product,
                 "serial_number": _safe(lambda: dev.serial_num, 0),
                 "analog_input_channels": _channel_names(dev.ai_physical_chans),
                 "analog_output_channels": _channel_names(dev.ao_physical_chans),
@@ -154,6 +264,7 @@ class NIDAQmxBackend(DAQBackend):
                 "ao_voltage_ranges": _pair_ranges(ao_rng),
                 "max_ai_rate_hz": _safe(lambda: float(dev.ai_max_single_chan_rate), 0.0),
                 "max_ao_rate_hz": _safe(lambda: float(dev.ao_max_rate), 0.0),
+                "suggested_measurement": suggested,
             }
         except DaqError as exc:
             return _daq_error(exc)
@@ -164,49 +275,43 @@ class NIDAQmxBackend(DAQBackend):
         samples: int,
         rate_hz: float,
         terminal_config: TerminalConfig,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
-        import nidaqmx
-        from nidaqmx.constants import AcquisitionType
         from nidaqmx.errors import DaqError
+
+        opts = options or AiOptions()
+        opts = AiOptions(
+            measurement=opts.measurement,
+            terminal_config=terminal_config,
+            thermocouple_type=opts.thermocouple_type,
+            accel_sensitivity_mv_per_g=opts.accel_sensitivity_mv_per_g,
+            gage_factor=opts.gage_factor,
+            strain_excit_v=opts.strain_excit_v,
+        )
 
         if samples < 1:
             return {"error": "samples must be >= 1"}
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
 
+        rate = opts.clamp_rate(rate_hz)
         try:
-            with nidaqmx.Task() as task:
-                task.ai_channels.add_ai_voltage_chan(
-                    channel,
-                    terminal_config=self._terminal(terminal_config),
-                    min_val=-10.0,
-                    max_val=10.0,
-                )
-                if samples == 1:
-                    raw = task.read()
-                else:
-                    task.timing.cfg_samp_clk_timing(
-                        rate=rate_hz,
-                        sample_mode=AcquisitionType.FINITE,
-                        samps_per_chan=samples,
-                    )
-                    timeout = max(10.0, samples / rate_hz + 5.0)
-                    raw = task.read(
-                        number_of_samples_per_channel=samples,
-                        timeout=timeout,
-                    )
-            values = _as_float_list(raw)
+            values = self._finite_read(channel, samples, rate, opts)
             return {
                 "channel": channel,
                 "samples": values,
-                "rate_hz": rate_hz,
+                "rate_hz": rate,
                 "terminal_config": terminal_config,
+                **opts.meta(),
                 "min": min(values) if values else 0.0,
                 "mean": sum(values) / len(values) if values else 0.0,
                 "max": max(values) if values else 0.0,
             }
         except DaqError as exc:
             return _daq_error(exc)
+        except ValueError as exc:
+            return {"error": str(exc)}
 
     def read_digital(self, channel: str) -> dict[str, Any]:
         import nidaqmx
@@ -268,50 +373,49 @@ class NIDAQmxBackend(DAQBackend):
         channel: str,
         duration_s: float,
         rate_hz: float,
+        *,
+        options: AiOptions | None = None,
     ) -> dict[str, Any]:
-        import nidaqmx
-        from nidaqmx.constants import AcquisitionType
         from nidaqmx.errors import DaqError
 
+        opts = options or AiOptions()
         if duration_s <= 0:
             return {"error": "duration_s must be > 0"}
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
 
-        n = max(1, int(round(duration_s * rate_hz)))
+        rate = opts.clamp_rate(rate_hz)
+        n = max(1, int(round(duration_s * rate)))
         try:
-            with nidaqmx.Task() as task:
-                task.ai_channels.add_ai_voltage_chan(
-                    channel,
-                    terminal_config=self._terminal("default"),
-                    min_val=-10.0,
-                    max_val=10.0,
-                )
-                task.timing.cfg_samp_clk_timing(
-                    rate=rate_hz,
-                    sample_mode=AcquisitionType.FINITE,
-                    samps_per_chan=n,
-                )
-                timeout = max(10.0, duration_s + 5.0)
-                raw = task.read(number_of_samples_per_channel=n, timeout=timeout)
-            values = _as_float_list(raw)
+            values = self._finite_read(channel, n, rate, opts)
             return {
                 "channel": channel,
                 "samples": values,
-                "rate_hz": rate_hz,
+                "rate_hz": rate,
                 "duration_s": duration_s,
                 "sample_count": len(values),
+                **opts.meta(),
             }
         except DaqError as exc:
             return _daq_error(exc)
+        except ValueError as exc:
+            return {"error": str(exc)}
 
-    def start_stream(self, channel: str, rate_hz: float) -> dict[str, Any]:
+    def start_stream(
+        self,
+        channel: str,
+        rate_hz: float,
+        *,
+        options: AiOptions | None = None,
+    ) -> dict[str, Any]:
         import nidaqmx
         from nidaqmx.constants import AcquisitionType
         from nidaqmx.errors import DaqError
 
+        opts = options or AiOptions()
         if rate_hz <= 0:
             return {"error": "rate_hz must be > 0"}
+        rate = opts.clamp_rate(rate_hz)
 
         with self._stream_lock:
             if self._stream_task is not None:
@@ -320,31 +424,29 @@ class NIDAQmxBackend(DAQBackend):
                 }
             try:
                 task = nidaqmx.Task()
-                task.ai_channels.add_ai_voltage_chan(
-                    channel,
-                    terminal_config=self._terminal("default"),
-                    min_val=-10.0,
-                    max_val=10.0,
-                )
+                self._configure_ai(task, channel, opts)
                 # Ten seconds of slack. An overflow (-200279) is fatal to the
                 # task, so the buffer needs to absorb a consumer that stalls on
                 # a GC pause or a burst of dashboard traffic, not just jitter.
                 task.timing.cfg_samp_clk_timing(
-                    rate=rate_hz,
+                    rate=rate,
                     sample_mode=AcquisitionType.CONTINUOUS,
-                    samps_per_chan=max(10_000, int(rate_hz * 10)),
+                    samps_per_chan=max(10_000, int(rate * 10)),
                 )
                 task.start()
-            except DaqError as exc:
+            except (DaqError, ValueError) as exc:
                 try:
                     task.close()
                 except Exception:
                     pass
+                if isinstance(exc, ValueError):
+                    return {"error": str(exc)}
                 return _daq_error(exc)
 
             self._stream_task = task
             self._stream_channel = channel
-            return {"channel": channel, "rate_hz": rate_hz}
+            self._stream_options = opts
+            return {"channel": channel, "rate_hz": rate, **opts.meta()}
 
     def read_stream(self, max_samples: int = 10_000) -> list[float]:
         from nidaqmx.errors import DaqError

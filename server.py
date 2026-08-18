@@ -38,6 +38,7 @@ from fastmcp import FastMCP
 
 from daq_mcp.backend import get_backend
 from daq_mcp.live import LiveMonitor
+from daq_mcp.measurements import AiOptions, Measurement
 from daq_mcp.wiring import (
     Wiring,
     delete_profile,
@@ -69,8 +70,9 @@ mcp = FastMCP("daq-mcp")
 # a line that a button also drives shorts one driver against the other. Listing
 # channels by direction means "this is an input" is enforced, not remembered.
 #
-# The defaults below match one USB-6421 bench. Override them from the dashboard
-# channel picker; named profiles land in .daq_mcp_profiles/ (gitignored).
+# The defaults below are a starting allowlist for the simulator-shaped names.
+# Override them from the dashboard channel picker; named profiles land in
+# .daq_mcp_profiles/ (gitignored).
 # --------------------------------------------------------------------------
 
 WRITES_ENABLED = os.getenv("DAQ_MCP_ALLOW_WRITE") == "1"
@@ -106,6 +108,33 @@ _current_wiring = _DEFAULT_WIRING
 # True once the HTTP dashboard is actually listening (env flag alone is not enough
 # for --dashboard-only / --http).
 _dashboard_serving = False
+
+
+def _infer_ai_options(
+    channel: str,
+    *,
+    measurement: Measurement | None = None,
+    thermocouple_type: Literal["J", "K", "T", "E", "N", "R", "S", "B"] = "K",
+    accel_sensitivity_mv_per_g: float = 100.0,
+    gage_factor: float = 2.0,
+) -> AiOptions:
+    """Build AiOptions, inferring measurement from the module product type."""
+    chosen: Measurement = measurement or "voltage"
+    if measurement is None:
+        device = channel.rsplit("/", 1)[0] if "/" in channel else channel
+        try:
+            desc = get_backend().describe_device(device)
+            suggested = desc.get("suggested_measurement")
+            if suggested in ("voltage", "strain", "thermocouple", "accelerometer"):
+                chosen = suggested
+        except Exception:
+            pass
+    return AiOptions(
+        measurement=chosen,
+        thermocouple_type=thermocouple_type,
+        accel_sensitivity_mv_per_g=accel_sensitivity_mv_per_g,
+        gage_factor=gage_factor,
+    )
 
 
 def _apply_wiring(
@@ -148,7 +177,10 @@ def _apply_wiring(
         if live.is_streaming():
             live.stop()
         started = live.start(
-            LIVE_CHANNEL, LIVE_RATE_HZ, poll_inputs=sorted(DIGITAL_INPUTS)
+            LIVE_CHANNEL,
+            LIVE_RATE_HZ,
+            poll_inputs=sorted(DIGITAL_INPUTS),
+            options=_infer_ai_options(LIVE_CHANNEL),
         )
         if "error" in started:
             result["live_error"] = started["error"]
@@ -180,7 +212,7 @@ def _inventory_for_device(device: str | None = None) -> dict[str, Any]:
     """Return channel inventory for one device, or a merged view of all devices.
 
     CompactDAQ puts pins on modules (`cDAQ1Mod8/...`), not the chassis
-    (`cDAQ1`). A demo that mixes AI on one module and DO on another needs the
+    (`cDAQ1`). Mixing AI on one module and DO on another needs the
     merged inventory — otherwise the picker can only ever see one module.
     """
     devices = get_backend().list_devices()
@@ -351,17 +383,29 @@ def read_analog(
     samples: int = 1,
     rate_hz: float = 1000.0,
     terminal_config: Literal["default", "rse", "nrse", "diff"] = "default",
+    measurement: Measurement = "voltage",
+    thermocouple_type: Literal["J", "K", "T", "E", "N", "R", "S", "B"] = "K",
+    accel_sensitivity_mv_per_g: float = 100.0,
+    gage_factor: float = 2.0,
 ) -> dict:
-    """Read voltage samples from an analog input channel.
+    """Read analog samples from a channel (voltage, strain, thermocouple, or accel).
 
-    channel: fully qualified, e.g. "Dev1/ai0"
-    samples: how many samples to acquire (1 = single instantaneous reading)
-    rate_hz: sample rate for multi-sample reads
+    channel: fully qualified, e.g. "cDAQ1Mod8/ai0" or "cDAQ1Mod1/ai0"
+    measurement: "voltage" (NI 9215), "strain" (NI 9236), "thermocouple" (NI 9213),
+      or "accelerometer" (NI 9234 IEPE). Must match the module type.
+    samples / rate_hz: acquisition size (DSA and specialty modules always use a
+      sample clock; thermocouple rates are capped ~75 Hz).
 
-    Returns the samples plus min/mean/max, so the model can reason about the
-    signal without pulling thousands of raw floats into context.
+    Returns samples plus min/mean/max and units.
     """
     _check(channel)
+    opts = AiOptions(
+        measurement=measurement,
+        terminal_config=terminal_config,
+        thermocouple_type=thermocouple_type,
+        accel_sensitivity_mv_per_g=accel_sensitivity_mv_per_g,
+        gage_factor=gage_factor,
+    )
     # A live stream holds this channel open, so a one-shot task would fail with
     # a resource-reserved error. Serve the most recent samples instead.
     if live.is_streaming(channel):
@@ -372,11 +416,14 @@ def read_analog(
             "rate_hz": live.rate_hz,
             "terminal_config": terminal_config,
             "source": "live_buffer",
+            **live.options.meta(),
             "min": min(values) if values else 0.0,
             "mean": sum(values) / len(values) if values else 0.0,
             "max": max(values) if values else 0.0,
         }
-    return get_backend().read_analog(channel, samples, rate_hz, terminal_config)
+    return get_backend().read_analog(
+        channel, samples, rate_hz, terminal_config, options=opts
+    )
 
 
 @mcp.tool
@@ -431,20 +478,36 @@ def write_analog(channel: str, voltage: float) -> dict:
 
 
 @mcp.tool
-def monitor_analog(channel: str, duration_s: float, rate_hz: float = 1000.0) -> dict:
-    """Acquire a finite analog waveform and return summary statistics.
+def monitor_analog(
+    channel: str,
+    duration_s: float,
+    rate_hz: float = 1000.0,
+    measurement: Measurement = "voltage",
+    thermocouple_type: Literal["J", "K", "T", "E", "N", "R", "S", "B"] = "K",
+    accel_sensitivity_mv_per_g: float = 100.0,
+    gage_factor: float = 2.0,
+) -> dict:
+    """Acquire a finite waveform and return summary statistics + preview.
 
-    Built for the "is my sensor behaving?" question: returns mean, RMS, peak-
-    to-peak, standard deviation, and a downsampled preview rather than the
-    full sample array. Keeps large acquisitions out of the context window.
+    Use measurement="strain" / "thermocouple" / "accelerometer" for specialty
+    CompactDAQ modules. Built for "is my sensor behaving?": mean, RMS,
+    peak-to-peak, std-dev, and a downsampled preview (not the full array).
     """
     _check(channel)
+    opts = AiOptions(
+        measurement=measurement,
+        thermocouple_type=thermocouple_type,
+        accel_sensitivity_mv_per_g=accel_sensitivity_mv_per_g,
+        gage_factor=gage_factor,
+    )
     if live.is_streaming(channel):
         wanted = max(1, int(round(duration_s * rate_hz)))
         samples = live.recent(wanted)
-        result = {"sample_count": len(samples)}
+        result = {"sample_count": len(samples), **live.options.meta()}
     else:
-        result = get_backend().acquire_waveform(channel, duration_s, rate_hz)
+        result = get_backend().acquire_waveform(
+            channel, duration_s, rate_hz, options=opts
+        )
         if "error" in result:
             return result
         samples = result.get("samples", [])
@@ -452,8 +515,10 @@ def monitor_analog(channel: str, duration_s: float, rate_hz: float = 1000.0) -> 
     return {
         "channel": channel,
         "duration_s": duration_s,
-        "rate_hz": rate_hz,
+        "rate_hz": result.get("rate_hz", rate_hz),
         "sample_count": result.get("sample_count", len(samples)),
+        "measurement": result.get("measurement", measurement),
+        "units": result.get("units", opts.units()),
         **stats,
         "preview": _downsample(samples),
     }
@@ -478,22 +543,38 @@ def self_test(device: str) -> dict:
 
 
 @mcp.tool
-def start_live(channel: str = LIVE_CHANNEL, rate_hz: float = LIVE_RATE_HZ) -> dict:
+def start_live(
+    channel: str = LIVE_CHANNEL,
+    rate_hz: float = LIVE_RATE_HZ,
+    measurement: Measurement = "voltage",
+    thermocouple_type: Literal["J", "K", "T", "E", "N", "R", "S", "B"] = "K",
+    accel_sensitivity_mv_per_g: float = 100.0,
+    gage_factor: float = 2.0,
+) -> dict:
     """Begin continuous background acquisition on an analog input channel.
 
-    Powers the browser dashboard and lets later reads answer "what has the
-    signal been doing?" rather than "what is it this instant". Only one
-    channel can stream at a time.
+    Powers the browser dashboard chart. Pass measurement for strain / TC /
+    accelerometer modules so the stream uses the correct DAQmx channel type.
+    Only one channel can stream at a time. Pair with save_capture after a run.
     """
     _check(channel)
-    result = live.start(channel, rate_hz, poll_inputs=sorted(DIGITAL_INPUTS))
+    opts = AiOptions(
+        measurement=measurement,
+        thermocouple_type=thermocouple_type,
+        accel_sensitivity_mv_per_g=accel_sensitivity_mv_per_g,
+        gage_factor=gage_factor,
+    )
+    result = live.start(
+        channel, rate_hz, poll_inputs=sorted(DIGITAL_INPUTS), options=opts
+    )
     if "error" in result:
         return result
     return {
         "streaming": True,
         "channel": channel,
-        "rate_hz": rate_hz,
+        "rate_hz": result.get("rate_hz", rate_hz),
         "dashboard_url": _dashboard_url(),
+        **opts.meta(),
     }
 
 
@@ -894,10 +975,19 @@ if __name__ == "__main__":
         # Start streaming immediately so the dashboard has a trace on open,
         # rather than requiring the model to call start_live first.
         started = live.start(
-            LIVE_CHANNEL, LIVE_RATE_HZ, poll_inputs=sorted(DIGITAL_INPUTS)
+            LIVE_CHANNEL,
+            LIVE_RATE_HZ,
+            poll_inputs=sorted(DIGITAL_INPUTS),
+            options=_infer_ai_options(LIVE_CHANNEL),
         )
         if "error" in started:
             log.warning("live acquisition did not start: %s", started["error"])
+        else:
+            log.info(
+                "live acquisition on %s (%s)",
+                LIVE_CHANNEL,
+                started.get("measurement"),
+            )
 
     if http_mode:
         import uvicorn

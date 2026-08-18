@@ -16,7 +16,7 @@
 
 NI-DAQmx lists every channel a device supports; it cannot tell you which pins
 are LEDs vs buttons. You assert that. Profiles store those assertions under
-names on disk (gitignored) so a demo bench, a lab bench, and a sim layout can
+names on disk (gitignored) so a lab bench, a field laptop, and a sim layout can
 coexist and be switched from the dashboard or MCP tools.
 """
 

@@ -3,6 +3,11 @@
 Thanks for taking a look. This is a personal learning / portfolio project;
 small, well-scoped contributions are welcome.
 
+## Documentation
+
+User-facing docs live under [`docs/`](docs/README.md). Prefer updating those
+when behavior changes, and keep the root README as a short overview.
+
 ## Before you change hardware paths
 
 - Prefer the simulated backend (`DAQ_MCP_SIMULATE=1`) for development.

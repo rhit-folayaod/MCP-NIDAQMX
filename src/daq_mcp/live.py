@@ -41,6 +41,10 @@ logger = logging.getLogger("daq-mcp")
 # slow enough that we read meaningful chunks rather than spinning on empties.
 _POLL_INTERVAL_S = 0.05
 
+# Dashboard frames only need ~1 s of waveform. Captures still use the full
+# rolling window; summarizing 20 k samples on every SSE tick stalls the UI.
+_DISPLAY_SAMPLES = 4_096
+
 # Digital inputs are polled at a fraction of the analog rate. Each read opens
 # and closes a task, so there is no point doing it every loop.
 _DIGITAL_POLL_INTERVAL_S = 0.1
@@ -53,9 +57,8 @@ _SNAPSHOT_CACHE_TTL_S = 0.08
 def summarize(samples: list[float]) -> dict[str, float]:
     """Mean / RMS / peak-to-peak / std-dev for a window of samples.
 
-    One pass rather than five. This runs on every dashboard frame over a
-    window of tens of thousands of samples, and the GIL it holds is taken
-    directly from the acquisition thread.
+    One pass rather than five. Dashboard frames summarize the short display
+    buffer; captures still walk the full rolling window in export_window.
     """
     n = len(samples)
     if n == 0:
@@ -110,6 +113,7 @@ class LiveMonitor:
         self._cache: dict[int, tuple[float, dict[str, Any]]] = {}
 
         self._samples: deque[float] = deque(maxlen=window_samples)
+        self._display: deque[float] = deque(maxlen=_DISPLAY_SAMPLES)
         self._channel: str | None = None
         self._rate_hz: float = 0.0
         self._total_samples: int = 0
@@ -143,6 +147,7 @@ class LiveMonitor:
                 return result
 
             self._samples.clear()
+            self._display.clear()
             self._channel = channel
             self._rate_hz = float(result.get("rate_hz", rate_hz))
             self._options = opts
@@ -235,11 +240,13 @@ class LiveMonitor:
                     self._error = message
                     self._failed = True
                     self._channel = None
+                self._publish_snapshot()
                 break
 
             if chunk:
                 with self._lock:
                     self._samples.extend(chunk)
+                    self._display.extend(chunk)
                     self._total_samples += len(chunk)
 
             now = time.monotonic()
@@ -257,6 +264,7 @@ class LiveMonitor:
                     with self._lock:
                         self._digital_inputs.update(states)
 
+            self._publish_snapshot()
             self._stop_event.wait(_POLL_INTERVAL_S)
 
     # -- readers -----------------------------------------------------------
@@ -290,9 +298,17 @@ class LiveMonitor:
             self._cache[max_points] = (now, result)
         return result
 
+    def _publish_snapshot(self) -> None:
+        """Refresh the frame cache on the acquisition thread, not the SSE loop."""
+        snap = self._build_snapshot(400)
+        now = time.monotonic()
+        with self._cache_lock:
+            self._cache[400] = (now, snap)
+
     def _build_snapshot(self, max_points: int) -> dict[str, Any]:
         with self._lock:
-            samples = list(self._samples)
+            samples = list(self._display)
+            window_n = len(self._samples)
             channel = self._channel
             rate_hz = self._rate_hz
             total = self._total_samples
@@ -307,7 +323,7 @@ class LiveMonitor:
             "channel": channel,
             "rate_hz": rate_hz,
             "total_samples": total,
-            "window_samples": len(samples),
+            "window_samples": window_n,
             "error": error,
             "trace": _downsample(samples, max_points),
             "latest": samples[-1] if samples else None,

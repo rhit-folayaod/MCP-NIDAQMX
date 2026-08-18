@@ -45,8 +45,9 @@ from starlette.routing import Mount, Route
 
 logger = logging.getLogger("daq-mcp")
 
-# How often the browser gets a frame. 20 Hz looks smooth and costs little.
-_FRAME_INTERVAL_S = 0.05
+# How often the browser gets a frame. 10 Hz is smooth and leaves the HTTP
+# event loop free for MCP tool calls on the same port.
+_FRAME_INTERVAL_S = 0.1
 
 
 def create_app(
@@ -99,7 +100,7 @@ def create_app(
             while True:
                 if await request.is_disconnected():
                     break
-                payload = json.dumps(snapshot())
+                payload = await asyncio.to_thread(lambda: json.dumps(snapshot()))
                 yield f"data: {payload}\n\n"
                 await asyncio.sleep(_FRAME_INTERVAL_S)
 
@@ -920,7 +921,7 @@ async function toggle(ch) {
 // Chart: plain canvas, no dependencies, redrawn each frame.
 const cv = $("chart");
 const ctx = cv.getContext("2d");
-function draw(trace) {
+function draw(trace, units) {
   const dpr = window.devicePixelRatio || 1;
   const w = cv.clientWidth, h = cv.clientHeight;
   if (cv.width !== w * dpr || cv.height !== h * dpr) {
@@ -935,7 +936,12 @@ function draw(trace) {
     return;
   }
 
-  let lo = Math.min(...trace), hi = Math.max(...trace);
+  let lo = trace[0], hi = trace[0];
+  for (let i = 1; i < trace.length; i++) {
+    const v = trace[i];
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
   if (hi - lo < 1e-6) { const m = (hi + lo) / 2; lo = m - 0.5; hi = m + 0.5; }
   const pad = (hi - lo) * 0.12; lo -= pad; hi += pad;
   const x = (i) => (i / (trace.length - 1)) * w;
@@ -946,9 +952,10 @@ function draw(trace) {
     const gy = (g / 4) * h;
     ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
   }
+  const unit = units ? (" " + units) : "";
   ctx.fillStyle = "#8b9bb0"; ctx.font = "10px ui-monospace, monospace";
-  ctx.fillText(hi.toFixed(2) + " V", 4, 11);
-  ctx.fillText(lo.toFixed(2) + " V", 4, h - 3);
+  ctx.fillText(hi.toFixed(2) + unit, 4, 11);
+  ctx.fillText(lo.toFixed(2) + unit, 4, h - 3);
 
   ctx.strokeStyle = "#4cc2ff"; ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.moveTo(x(0), y(trace[0]));
@@ -981,16 +988,30 @@ function render(s) {
     const lamp = document.querySelector('[data-lamp="' + ch2 + '"]');
     if (lamp) lamp.className = "lamp" + (v ? " on" : "");
   }
-  draw(s.trace);
+  draw(s.trace, s.units);
+}
+
+let pendingFrame = null;
+let rafId = 0;
+let stream = null;
+function queueRender(s) {
+  pendingFrame = s;
+  if (document.hidden) return;
+  if (!rafId) {
+    rafId = requestAnimationFrame(() => {
+      rafId = 0;
+      if (pendingFrame) render(pendingFrame);
+    });
+  }
 }
 
 function connect() {
-  const es = new EventSource(withToken("/api/stream"));
-  es.onopen = () => { $("p-conn").textContent = "connected"; $("p-conn").className = "pill live"; };
-  es.onmessage = (e) => render(JSON.parse(e.data));
-  es.onerror = () => {
+  if (stream) stream.close();
+  stream = new EventSource(withToken("/api/stream"));
+  stream.onopen = () => { $("p-conn").textContent = "connected"; $("p-conn").className = "pill live"; };
+  stream.onmessage = (e) => queueRender(JSON.parse(e.data));
+  stream.onerror = () => {
     $("p-conn").textContent = "reconnecting"; $("p-conn").className = "pill warn";
-    es.close(); setTimeout(connect, 1500);
   };
 }
 </script>

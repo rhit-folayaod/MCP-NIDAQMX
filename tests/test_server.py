@@ -199,6 +199,21 @@ def test_digital_write_read_round_trip(monkeypatch):
     assert server.read_digital("Dev1/port0/line6")["value"] is False
 
 
+def test_animate_digital_ends_off(monkeypatch):
+    monkeypatch.setattr(server, "WRITES_ENABLED", True)
+    result = server.animate_digital(duration_s=0.5, step_s=0.05)
+    assert result.get("ok") is True
+    assert result.get("all_off") is True
+    assert result.get("steps", 0) >= 1
+    assert server.read_digital("Dev1/port0/line6")["value"] is False
+
+
+def test_animate_digital_respects_write_gate():
+    blocked = server.animate_digital(duration_s=0.5)
+    assert "error" in blocked
+    assert "DAQ_MCP_ALLOW_WRITE" in blocked["error"]
+
+
 def test_input_channels_cannot_be_written(monkeypatch):
     """Buttons are readable but must never be driven: that is a short circuit."""
     monkeypatch.setattr(server, "WRITES_ENABLED", True)

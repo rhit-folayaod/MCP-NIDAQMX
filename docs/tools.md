@@ -42,6 +42,7 @@ buffer and include `"source": "live_buffer"`.
 | --- | --- |
 | `write_analog` | DC voltage out (clamped); returns requested vs applied |
 | `write_digital` | Drive one DO line; returns hardware read-back |
+| `animate_digital` | Chase pattern on all allowlisted DOs, then all off |
 | `read_digital` | Read one DI (or readable) line |
 
 Require `DAQ_MCP_ALLOW_WRITE=1` and a writable channel.

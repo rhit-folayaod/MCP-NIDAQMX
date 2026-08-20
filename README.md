@@ -7,7 +7,8 @@ Not affiliated with, endorsed by, or supported by NI / Emerson. Licensed under
 the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
 
 **Documentation:** [docs/](docs/README.md) — architecture, safety, configuration,
-tool reference, devices, examples, limitations, troubleshooting.
+tool reference, devices, examples, limitations, troubleshooting, development
+history.
 
 Portfolio-oriented stack notes: [TECH_STACK.md](TECH_STACK.md).
 
@@ -50,7 +51,7 @@ wiring tools — profiles stay local (gitignored). Details: [docs/safety.md](doc
 | --- | --- |
 | Discovery | `list_devices`, `describe_device`, `self_test` |
 | Analog in | `read_analog`, `monitor_analog` (`measurement`: voltage / strain / thermocouple / accelerometer) |
-| Digital / AO | `read_digital`, `write_digital`, `write_analog` |
+| Digital / AO | `read_digital`, `write_digital`, `write_analog`, `animate_digital` |
 | Live | `start_live`, `live_status`, `stop_live`, `save_capture`, `list_captures` |
 | Wiring | `get_wiring`, `set_wiring`, profile list / load / delete |
 

@@ -32,6 +32,7 @@ import math
 import os
 import sys
 import threading
+import time
 from typing import Any, Literal
 
 from fastmcp import FastMCP
@@ -447,10 +448,80 @@ def write_digital(channel: str, value: bool) -> dict:
     if not WRITES_ENABLED:
         return {"error": "Writes disabled. Set DAQ_MCP_ALLOW_WRITE=1 to enable."}
     _check_writable(channel)
+    return _drive_digital(channel, value)
+
+
+def _drive_digital(channel: str, value: bool) -> dict:
     result = get_backend().write_digital(channel, value)
     if "error" not in result:
         live.set_digital_output(channel, bool(result["value"]))
     return result
+
+
+@mcp.tool
+def animate_digital(
+    duration_s: float = 6.0,
+    step_s: float = 0.08,
+    pattern: Literal["chase"] = "chase",
+) -> dict:
+    """Run a short LED chase on all allowlisted digital outputs, then turn them off.
+
+    Runs in this process (not one MCP call per blink) so the pattern looks
+    smooth on the bench and the dashboard lamps. Always finishes with every
+    line low. Requires DAQ_MCP_ALLOW_WRITE=1.
+
+    duration_s: how long to dance (capped at 12 s).
+    step_s: time between steps (capped 0.04–0.25 s).
+    pattern: "chase" is a ping-pong one-hot across the DO lines.
+    """
+    if not WRITES_ENABLED:
+        return {"error": "Writes disabled. Set DAQ_MCP_ALLOW_WRITE=1 to enable."}
+    lines = sorted(DIGITAL_OUTPUTS)
+    if not lines:
+        return {"error": "No digital outputs in the active wiring profile."}
+    for ch in lines:
+        _check_writable(ch)
+
+    duration = max(0.5, min(12.0, float(duration_s)))
+    step = max(0.04, min(0.25, float(step_s)))
+    n = len(lines)
+    order = list(range(n)) + list(range(n - 2, 0, -1)) if n > 1 else [0]
+    if not order:
+        order = [0]
+
+    started = time.monotonic()
+    steps = 0
+    prev: int | None = None
+    try:
+        for ch in lines:
+            _drive_digital(ch, False)
+        while time.monotonic() - started < duration:
+            idx = order[steps % len(order)]
+            if prev is not None and prev != idx:
+                result = _drive_digital(lines[prev], False)
+                if "error" in result:
+                    return result
+            result = _drive_digital(lines[idx], True)
+            if "error" in result:
+                return result
+            prev = idx
+            steps += 1
+            remaining = duration - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            time.sleep(min(step, remaining))
+    finally:
+        for ch in lines:
+            _drive_digital(ch, False)
+
+    return {
+        "ok": True,
+        "pattern": pattern,
+        "channels": lines,
+        "steps": steps,
+        "duration_s": duration,
+        "all_off": True,
+    }
 
 
 @mcp.tool
